@@ -44,6 +44,8 @@ pipeline {
         skipDefaultCheckout(false)
         buildDiscarder(logRotator(numToKeepStr: '20'))
         durabilityHint('MAX_SURVIVABILITY')
+        ansiColor('xterm')
+
     }
 
     stages {
