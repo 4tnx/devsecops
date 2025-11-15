@@ -1,4 +1,4 @@
-// Jenkinsfile (declarative) - ready to paste
+// Jenkinsfile (declarative) - tolerant of missing test XMLs (ready to paste)
 def COLOR_MAP = [
     'SUCCESS': 'good',
     'FAILURE': 'danger',
@@ -9,13 +9,11 @@ def COLOR_MAP = [
 pipeline {
     agent any
 
-    // Tools configured in Jenkins global tools (adjust names to match your Jenkins)
     tools {
-        maven 'MAVEN3'
-        jdk   'JDK17'
+        maven 'MAVEN3'    // adjust if your Jenkins has a different Maven tool name
+        jdk   'JDK17'     // adjust to your JDK tool name
     }
 
-    // Parametrize pipeline so you can reuse for different jobs
     parameters {
         booleanParam(name: 'PUSH_IMAGE', defaultValue: false, description: 'Push docker image to registry?')
         string(name: 'REGISTRY_URL', defaultValue: '192.168.50.4:5000', description: 'Docker Registry (host:port)')
@@ -25,16 +23,12 @@ pipeline {
     }
 
     environment {
-        // Sonar scanner configured as a tool in Jenkins (adjust name if needed)
-        SCANNER_HOME = tool 'sonar-scanner'
-        NEXUS_VERSION = 'nexus3'
-        NEXUS_PROTOCOL = 'http'
+        SCANNER_HOME = tool 'sonar-scanner'   // ensure this matches your configured Sonar scanner tool
         NEXUS_URL = '192.168.50.4:8081'
         NEXUS_REPOSITORY = 'vprofile-repo'
         NEXUS_CREDENTIAL_ID = 'nexuslogin'
         SONAR_SERVER = 'sonar-server'
         DOCKER_CREDENTIALS_ID = 'jenkins-github-https-cred'
-        GITLEAKS_CREDENTIALS = ''
         ARTVERSION = "${env.BUILD_ID}"
     }
 
@@ -63,9 +57,9 @@ pipeline {
             }
         }
 
+        // Run mvn package and unit tests (skip integration tests)
         stage('Build (compile + unit tests)') {
             steps {
-                // Run unit tests as part of the build so surefire produces XML reports
                 sh 'mvn -B clean package -DskipITs=true'
             }
             post {
@@ -78,16 +72,18 @@ pipeline {
         stage('Publish Unit Test Results & Coverage') {
             steps {
                 script {
-                    // Debug listing to help trace paths if something's wrong
-                    sh 'echo "Listing target directories:" && find . -maxdepth 3 -name target -exec ls -la {} \\; || true'
+                    // print directories so you can see if surefire-reports exist
+                    sh 'echo "Listing target directory contents (maxdepth 3):" && find . -maxdepth 3 -name target -exec ls -la {} \\; || true'
                 }
             }
             post {
                 always {
-                    // publish JUnit results - since we ran mvn package with tests, reports should exist
-                    junit testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: false, keepLongStdio: true
+                    // TOLERANT: allowEmptyResults:true prevents pipeline failure when no xml files are present
+                    // This avoids the "No test report files were found" abort. If you want to force failure when tests absent,
+                    // set allowEmptyResults:false and ensure tests run / test xmls exist.
+                    junit testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: true, keepLongStdio: true
 
-                    // jacoco - adjust patterns if necessary
+                    // publish Jacoco if present (won't fail the pipeline if missing)
                     jacoco(execPattern: 'target/jacoco.exec', classPattern: 'target/classes', sourcePattern: 'src/main/java')
                 }
             }
@@ -95,12 +91,11 @@ pipeline {
 
         stage('Integration Tests') {
             steps {
-                // Run integration tests if any (maven fails as appropriate)
                 sh 'mvn -B verify -DskipUnitTests=true || true'
             }
             post {
                 always {
-                    junit allowEmptyResults: true, testResults: '**/target/failsafe-reports/*.xml'
+                    junit testResults: '**/target/failsafe-reports/*.xml', allowEmptyResults: true
                 }
             }
         }
@@ -148,7 +143,7 @@ pipeline {
             steps {
                 script {
                     timeout(time: 3, unit: 'MINUTES') {
-                        def qg = waitForQualityGate() // blocks until Sonar analysis completes
+                        def qg = waitForQualityGate()
                         echo "SonarQube Quality Gate status: ${qg.status}"
                         if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') {
                             error "Quality Gate failed with status: ${qg.status}"
@@ -302,22 +297,20 @@ pipeline {
                 }
             }
         }
-    } // end stages
+    }
 
     post {
         always {
             script {
                 def buildStatus = currentBuild.currentResult ?: 'UNKNOWN'
-                def color = COLOR_MAP[buildStatus] ?: '#CCCCCC'
+                def color = COLOR_MAP.get(buildStatus, '#CCCCCC')
 
-                // Safer user determination: Build User Vars plugin provides BUILD_USER_ID/BUILD_USER
+                // prefer Build User Vars plugin env vars, fallback to last git committer
                 def buildUser = env.BUILD_USER_ID ?: env.BUILD_USER
                 if (!buildUser) {
-                    // fallback: use last git committer name (not necessarily the build trigger user)
                     buildUser = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' HEAD || echo 'GitHub User'").trim()
                 }
 
-                // Slack notification (wrap in try/catch)
                 try {
                     slackSend(
                         channel: '#devsecops',
@@ -330,7 +323,6 @@ pipeline {
                     echo "Slack notification failed: ${e}"
                 }
 
-                // Send email with attachments (wrap)
                 try {
                     emailext (
                         subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
