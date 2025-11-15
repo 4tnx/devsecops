@@ -175,16 +175,35 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-fs.json', allowEmptyArchive: true } }
         }
 
-        stage('Build Docker Image') {
-            steps {
-                script {
-                    env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
-                    sh "docker rmi -f ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG} || true"
-                    dockerImage = docker.build("${params.IMAGE_NAME}:latest", ".")
-                    sh "docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}"
+      stage('Build Docker Image') {
+    steps {
+        script {
+            env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
+            // Give this stage more time (adjust minutes as needed)
+            timeout(time: 45, unit: 'MINUTES') {
+                // retry transient failures (2 retries)
+                retry(2) {
+                    sh '''
+                        # enable BuildKit for faster builds and better caching
+                        export DOCKER_BUILDKIT=1
+
+                        # pre-pull the base image(s) referenced in your Dockerfile to avoid long downloads inside build
+                        # replace with the actual base image you use e.g. openjdk:17-jdk or openjdk:17-jdk-slim
+                        docker pull openjdk:17-jdk || true
+
+                        # use --network host to avoid DNS issues and sometimes speed up downloads,
+                        # --pull to attempt to get latest base image, --progress=plain for readable logs
+                        # --cache-from attempts to use previous image as cache (push previous image to registry to benefit)
+                        docker build --network host --progress=plain --pull --cache-from ${params.IMAGE_NAME}:latest -t ${params.IMAGE_NAME}:latest .
+                    '''
                 }
             }
+            // tag the build-specific version
+            sh "docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}"
         }
+    }
+}
+
 
         stage('Trivy Image Scan') {
             steps {
