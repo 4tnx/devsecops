@@ -64,29 +64,31 @@ pipeline {
             }
         }
 
-        stage('Build') {
-            steps {
-                sh 'mvn -B -DskipTests clean package'
-            }
-            post {
-                success {
-                    archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true
-                }
-            }
+      stage('Build') {
+    steps {
+        // run tests as part of build so surefire reports exist
+        sh 'mvn -B clean package'
+    }
+    post {
+        success {
+            archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true
         }
+    }
+}
 
-        stage('Unit Tests & Reports') {
-            steps {
-                sh 'mvn test -DskipITs=false'
-            }
-            post {
-                always {
-                    junit '**/target/surefire-reports/*.xml'
-                    // If you use jacoco plugin in your pom, the agent will produce the exec file
-                    jacoco(execPattern: 'target/jacoco.exec', classPattern: 'target/classes', sourcePattern: 'src/main/java')
-                }
-            }
+stage('Unit Tests & Reports') {
+    steps {
+        // run unit tests (fails the stage if tests fail)
+        sh 'mvn -B test -DskipITs=true'
+    }
+    post {
+        always {
+            junit allowEmptyResults: false, testResults: '**/target/surefire-reports/*.xml'
+            jacoco(execPattern: 'target/jacoco.exec', classPattern: 'target/classes', sourcePattern: 'src/main/java')
         }
+    }
+}
+
 
         stage('Integration Tests') {
             steps {
@@ -317,70 +319,59 @@ pipeline {
     } // end stages
 
     post {
-        always {
-            script {
-                // Determine build status and user
-                def buildStatus = currentBuild.currentResult
-                def color = COLOR_MAP[buildStatus] ?: '#CCCCCC'
-                // Attempt to get user who triggered build
-                def buildUser = 'GitHub User'
-                try {
-                    def causes = currentBuild.rawBuild.getCauses()
-                    for (c in causes) {
-                        if (c.toString().contains('UserIdCause')) {
-                            buildUser = c.getUserId() ?: buildUser
-                        }
-                    }
-                } catch (ignored) {}
+    always {
+        script {
+            def buildStatus = currentBuild.currentResult
+            def color = COLOR_MAP[buildStatus] ?: '#CCCCCC'
+            // safer: use Build User Vars plugin env variables (install plugin if missing)
+            def buildUser = env.BUILD_USER_ID ?: env.BUILD_USER ?: 'GitHub User'
 
-                // Slack notification (requires slack plugin and configured slackSend)
-                try {
-                    slackSend(
-                        channel: '#devsecops',
-                        color: color,
-                        message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
+            try {
+                slackSend(
+                    channel: '#devsecops',
+                    color: color,
+                    message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
 👤 *Started by:* ${buildUser}
 🔗 *Build URL:* <${env.BUILD_URL}|Click Here for Details>"""
-                    )
-                } catch (e) {
-                    echo "Slack notification failed: ${e}"
-                }
-
-                // Send email with attachments
-                try {
-                    emailext (
-                        subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                        body: """
-                            <p> Created by Mekni Mohamed Amin </p>
-                            <p> DevSecops CICD pipeline status.</p>
-                            <p>Project: ${env.JOB_NAME}</p>
-                            <p>Build Number: ${env.BUILD_NUMBER}</p>
-                            <p>Build Status: ${buildStatus}</p>
-                            <p>Started by: ${buildUser}</p>
-                            <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-                        """,
-                        to: 'mekni.amin75@gmail.com',
-                        from: 'mmekni66@gmail.com',
-                        mimeType: 'text/html',
-                        attachmentsPattern: 'trivy-fs.json,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json'
-                    )
-                } catch (e) {
-                    echo "Email notification failed: ${e}"
-                }
+                )
+            } catch (e) {
+                echo "Slack notification failed: ${e}"
             }
-        }
 
-        failure {
-            script {
-                echo "Build FAILED - additional cleanup or ticketing may be added here."
-                
-            }
-        }
-
-        success {
-            script {
-                echo "Build SUCCESS"
+            try {
+                emailext (
+                    subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        <p> Created by Mekni Mohamed Amin </p>
+                        <p> DevSecops CICD pipeline status.</p>
+                        <p>Project: ${env.JOB_NAME}</p>
+                        <p>Build Number: ${env.BUILD_NUMBER}</p>
+                        <p>Build Status: ${buildStatus}</p>
+                        <p>Started by: ${buildUser}</p>
+                        <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    """,
+                    to: 'mekni.amin75@gmail.com',
+                    from: 'mmekni66@gmail.com',
+                    mimeType: 'text/html',
+                    attachmentsPattern: 'trivy-fs.json,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json'
+                )
+            } catch (e) {
+                echo "Email notification failed: ${e}"
             }
         }
     }
+
+    failure {
+        script {
+            echo "Build FAILED - additional cleanup or ticketing may be added here."
+        }
+    }
+
+    success {
+        script {
+            echo "Build SUCCESS"
+        }
+    }
+}
+
 }
