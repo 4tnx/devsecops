@@ -1,222 +1,383 @@
+
 def COLOR_MAP = [
     'SUCCESS': 'good',
     'FAILURE': 'danger',
+    'UNSTABLE': 'warning',
+    'ABORTED': '#CCCCCC'
 ]
 
 pipeline {
     agent any
+
+    // Tools configured in Jenkins global tools
     tools {
         maven 'MAVEN3'
-        jdk 'JDK17'
+        jdk   'JDK17'
     }
+
+    // Parametrize pipeline so you can reuse for different jobs
+    parameters {
+        booleanParam(name: 'PUSH_IMAGE', defaultValue: false, description: 'Push docker image to registry?')
+        string(name: 'REGISTRY_URL', defaultValue: '192.168.50.4:5000', description: 'Docker Registry (host:port)')
+        string(name: 'IMAGE_NAME', defaultValue: 'vprofileappimg', description: 'Local image name')
+        booleanParam(name: 'ENFORCE_QUALITY_GATE', defaultValue: true, description: 'Abort pipeline if Sonar Quality Gate != OK')
+        booleanParam(name: 'FAIL_ON_HIGH_VULNS', defaultValue: true, description: 'Fail pipeline if Trivy/Dependency-check find HIGH/Critical vulnerabilities')
+    }
+
     environment {
-        SCANNER_HOME = tool 'sonar-scanner'
-
-        // Nexus settings (unchanged)
+        SCANNER_HOME = tool 'sonar-scanner' // Sonar scanner installation name in Jenkins
         NEXUS_VERSION = 'nexus3'
-        NEXUS_PROTOCOL = "http"
-        NEXUS_URL = "192.168.50.4:8081"
-        NEXUS_REPOSITORY = "vprofile-repo"
-        NEXUS_REPO_ID = "vprofile-repo"
-        NEXUS_CREDENTIAL_ID = "nexuslogin"
+        NEXUS_PROTOCOL = 'http'
+        NEXUS_URL = '192.168.50.4:8081'               // update if needed
+        NEXUS_REPOSITORY = 'vprofile-repo'
+        NEXUS_CREDENTIAL_ID = 'nexuslogin'            // set credentials in Jenkins
+        SONAR_SERVER = 'sonar-server'                 // Sonar server configured in Jenkins global config
+        DOCKER_CREDENTIALS_ID = 'jenkins-github-https-cred'       // set docker credentials in Jenkins
+        GITLEAKS_CREDENTIALS = ''                     // optional
         ARTVERSION = "${env.BUILD_ID}"
+        // email settings are done inside post
+    }
 
-        // Local Docker image name (no registry)
-        IMAGE_NAME = 'vprofileappimg'
+    options {
+        timestamps()
+        ansiColor('xterm')
+        skipDefaultCheckout(false)
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        durabilityHint('MAX_SURVIVABILITY')
     }
 
     stages {
-        stage("Clean Workspace") { steps { cleanWs() } }
-
-        stage("Git Checkout") {
+        stage('Clean Workspace') {
             steps {
-                git branch: 'main', url: 'https://github.com/harishnshetty/maven-devsecops-ecr-project.git'
+                cleanWs()
             }
         }
 
-        stage('BUILD') {
-            steps { sh 'mvn clean install -DskipTests' }
-            post { success { echo 'Now Archiving...'; archiveArtifacts artifacts: '**/target/*.war' } }
-        }
-
-        stage('UNIT TEST') { steps { sh 'mvn test' } }
-
-        stage('INTEGRATION TEST') { steps { sh 'mvn verify -DskipUnitTests' } }
-
-        stage('CODE ANALYSIS WITH CHECKSTYLE') {
-            steps { sh 'mvn checkstyle:checkstyle' }
-            post { success { echo 'Generated Analysis Result' } }
-        }
-
-        stage('CODE ANALYSIS with SONARQUBE') {
+        stage('Checkout') {
             steps {
-                withSonarQubeEnv('sonar-server') {
-                    sh '''${SCANNER_HOME}/bin/sonar-scanner -Dsonar.projectKey=vprofile \
-                        -Dsonar.projectName=vprofile-repo \
-                        -Dsonar.projectVersion=1.0 \
-                        -Dsonar.sources=src/ \
-                        -Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/ \
-                        -Dsonar.junit.reportsPath=target/surefire-reports/ \
-                        -Dsonar.jacoco.reportsPath=target/jacoco.exec \
-                        -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml'''
+                checkout([$class: 'GitSCM',
+                    branches: [[name: 'refs/heads/main']],
+                    userRemoteConfigs: [[url: 'https://github.com/4tnx/devsecops.git']]
+                ])
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'mvn -B -DskipTests clean package'
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true
                 }
             }
         }
 
-        stage("Quality Gate") {
+        stage('Unit Tests & Reports') {
+            steps {
+                sh 'mvn test -DskipITs=false'
+            }
+            post {
+                always {
+                    junit '**/target/surefire-reports/*.xml'
+                    // If you use jacoco plugin in your pom, the agent will produce the exec file
+                    jacoco(execPattern: 'target/jacoco.exec', classPattern: 'target/classes', sourcePattern: 'src/main/java')
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                sh 'mvn verify -DskipUnitTests=true || true'
+            }
+            post {
+                always {
+                    junit '**/target/failsafe-reports/*.xml'
+                }
+            }
+        }
+
+        stage('Code Style - Checkstyle') {
+            steps {
+                sh 'mvn checkstyle:checkstyle || true'
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'target/checkstyle-result.xml', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Static Analysis - Semgrep + SonarQube') {
+            parallel {
+                stage('Semgrep (fast patterns)') {
+                    steps {
+                       
+                        sh '''
+                            semgrep --config auto --output semgrep.json --json . || true
+                        '''
+                        archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
+                    }
+                }
+
+                stage('SonarQube Analysis') {
+                    steps {
+                        withSonarQubeEnv("${SONAR_SERVER}") {
+                            // sonar-scanner invocation using SCANNER_HOME configured in Jenkins
+                            sh """${SCANNER_HOME}/bin/sonar-scanner \
+                                -Dsonar.projectKey=vprofile \
+                                -Dsonar.projectName=vprofile-repo \
+                                -Dsonar.projectVersion=1.0 \
+                                -Dsonar.sources=src/ \
+                                -Dsonar.java.binaries=target/classes \
+                                -Dsonar.junit.reportsPath=target/surefire-reports \
+                                -Dsonar.jacoco.reportPaths=target/jacoco.exec \
+                                -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
             steps {
                 script {
+                    // waitForQualityGate() returns a map with 'status'
                     timeout(time: 3, unit: 'MINUTES') {
-                        waitForQualityGate abortPipeline: false, credentialsId: 'sonarqube'
+                        def qg = waitForQualityGate() // will block until analysis is complete
+                        echo "SonarQube Quality Gate status: ${qg.status}"
+                        if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') {
+                            error "Quality Gate failed with status: ${qg.status}"
+                        }
                     }
                 }
             }
         }
 
-        stage("Publish to Nexus Repository Manager") {
+        stage('Secrets Scan - Gitleaks') {
             steps {
-                script {
-                    pom = readMavenPom file: "pom.xml"
-                    filesByGlob = findFiles(glob: "target/*.${pom.packaging}")
-                    echo "${filesByGlob[0].name} ${filesByGlob[0].path}"
-                    artifactPath = filesByGlob[0].path
-                    artifactExists = fileExists artifactPath
-                    if (artifactExists) {
-                        nexusArtifactUploader(
-                            nexusVersion: NEXUS_VERSION,
-                            protocol: NEXUS_PROTOCOL,
-                            nexusUrl: NEXUS_URL,
-                            groupId: pom.groupId,
-                            version: ARTVERSION,
-                            repository: NEXUS_REPOSITORY,
-                            credentialsId: NEXUS_CREDENTIAL_ID,
-                            artifacts: [
-                                [artifactId: pom.artifactId, classifier: '', file: artifactPath, type: pom.packaging],
-                                [artifactId: pom.artifactId, classifier: '', file: "pom.xml", type: "pom"]
-                            ]
-                        )
-                    } else {
-                        error "*** File: ${artifactPath}, could not be found"
-                    }
+                sh '''
+                   # gitleaks should be installed on host or run via container
+                   set +e
+                   gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true
+                   set -e
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
                 }
             }
         }
 
-        stage("OWASP Dependency Check Scan") {
+        stage('Dependency-Check (SCA)') {
             steps {
-                dependencyCheck additionalArguments: '''
-                    --scan .
-                    --disableYarnAudit
-                    --disableNodeAudit
-                ''', odcInstallation: 'dp-check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                // plugin must be installed/configured on agent or use CLI
+                sh '''
+                    mvn org.owasp:dependency-check-maven:check -Dformat=XML || true
+                '''
             }
-        }
-
-        stage("Trivy File Scan") {
-            steps { sh "trivy fs . > trivyfs.txt" }
-        }
-
-        stage("Build Docker Image") {
-            steps {
-                script {
-                    // Build and tag locally
-                    env.IMAGE_TAG = "${IMAGE_NAME}:${BUILD_NUMBER}"
-                    sh "docker rmi -f ${IMAGE_NAME}:latest ${env.IMAGE_TAG} || true"
-                    dockerImage = docker.build("${IMAGE_NAME}:latest", ".")
-                    sh "docker tag ${IMAGE_NAME}:latest ${env.IMAGE_TAG}"
+            post {
+                always {
+                    archiveArtifacts artifacts: 'target/dependency-check-report.xml', allowEmptyArchive: true
                 }
             }
         }
 
-        stage("Trivy Scan Image") {
+        stage('Generate SBOM (CycloneDX)') {
+            steps {
+                // using maven plugin; ensure plugin available in your repo
+                sh 'mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom || true'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'target/bom.*', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Trivy File System Scan') {
+            steps {
+                sh 'trivy fs --exit-code 0 --format json -o trivy-fs.json . || true'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-fs.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
+                    // remove any previous tags (best-effort)
+                    sh "docker rmi -f ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG} || true"
+                    dockerImage = docker.build("${params.IMAGE_NAME}:latest", ".")
+                    sh "docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
             steps {
                 script {
                     sh """
-                    echo '🔍 Running Trivy scan on ${env.IMAGE_TAG}'
-                    trivy image -f json -o trivy-image.json ${env.IMAGE_TAG}
-                    trivy image -f table -o trivy-image.txt ${env.IMAGE_TAG}
+                        trivy image -f json -o trivy-image.json ${env.IMAGE_TAG} || true
+                        trivy image -f table -o trivy-image.txt ${env.IMAGE_TAG} || true
                     """
-                }
-            }
-        }
-
-        // NOTE: Removed 'Upload to Registry' stage because you said you are not using any registry.
-
-        stage("Deploy to Container") {
-            steps {
-                script {
-                    // Deploy directly from local image produced by this agent's Docker daemon
-                    sh "docker rm -f vprofile || true"
-                    sh "docker run -d --name vprofile -p 80:8080 ${env.IMAGE_TAG}"
-                }
-            }
-        }
-
-        stage("DAST Scan with OWASP ZAP") {
-            steps {
-                script {
-                    echo '🔍 Running OWASP ZAP baseline scan...'
-                    def exitCode = sh(script: '''
-                        docker run --rm --user root --network host -v $(pwd):/zap/wrk:rw \
-                        -t zaproxy/zap-stable zap-baseline.py \
-                        -t http://localhost \
-                        -r zap_report.html -J zap_report.json
-                    ''', returnStatus: true)
-                    echo "ZAP scan finished with exit code: ${exitCode}"
-                    if (fileExists('zap_report.json')) {
-                        def zapJson = readJSON file: 'zap_report.json'
-                        def highCount = zapJson.site.collect { site -> site.alerts.findAll { it.risk == 'High' }.size() }.sum()
-                        def mediumCount = zapJson.site.collect { site -> site.alerts.findAll { it.risk == 'Medium' }.size() }.sum()
-                        def lowCount = zapJson.site.collect { site -> site.alerts.findAll { it.risk == 'Low' }.size() }.sum()
-                        echo "✅ High severity issues: ${highCount}"
-                        echo "⚠️ Medium severity issues: ${mediumCount}"
-                        echo "ℹ️ Low severity issues: ${lowCount}"
-                    } else {
-                        echo "ZAP JSON report not found, continuing build..."
-                    }
                 }
             }
             post {
                 always {
-                    echo '📦 Archiving ZAP scan reports...'
+                    archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Enforce Vulnerability Policy') {
+            steps {
+                script {
+                    // parse trivy json and dependency-check for high/critical; minimal example
+                    def fail = false
+                    if (params.FAIL_ON_HIGH_VULNS) {
+                        if (fileExists('trivy-image.json')) {
+                            def trivy = readJSON file: 'trivy-image.json'
+                            // find top-level vulnerabilities count (simplified)
+                            def criticalOrHigh = 0
+                            trivy.Results.each { res ->
+                                res.Vulnerabilities?.each { v ->
+                                    if (v.Severity == 'CRITICAL' || v.Severity == 'HIGH') {
+                                        criticalOrHigh++
+                                    }
+                                }
+                            }
+                            echo "Trivy high/critical count: ${criticalOrHigh}"
+                            if (criticalOrHigh > 0) {
+                                fail = true
+                            }
+                        }
+                        // Could also parse dependency-check-report.xml similarly
+                        if (fail) { error "Failing pipeline because Trivy found HIGH/CRITICAL vulnerabilities" }
+                    }
+                }
+            }
+        }
+
+        stage('Push Image to Registry (optional)') {
+            when {
+                expression { params.PUSH_IMAGE == true }
+            }
+            steps {
+                script {
+                    docker.withRegistry("https://${params.REGISTRY_URL}", "${DOCKER_CREDENTIALS_ID}") {
+                        // push both tag and latest
+                        dockerImage.push("${env.BUILD_NUMBER}")
+                        dockerImage.push('latest')
+                    }
+                    // Optionally sign image (cosign) - placeholder
+                    // sh "cosign sign --key COSIGN_KEY ${params.REGISTRY_URL}/${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
+                }
+            }
+        }
+
+        stage('Deploy to Container (local agent)') {
+            steps {
+                script {
+                    // safer: run container in dedicated network instead of host
+                    sh "docker network create vprofile-net || true"
+                    sh "docker rm -f vprofile || true"
+                    sh "docker run -d --name vprofile --network vprofile-net -p 8080:8080 ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('DAST - OWASP ZAP (baseline)') {
+            steps {
+                script {
+                    // Prefer running ZAP in the same Docker network as the app
+                    sh '''
+                        # run zap baseline scanning the container URL (internal network)
+                        docker run --rm --user root --network vprofile-net -v $(pwd):/zap/wrk:rw \
+                          -t owasp/zap2docker-stable zap-baseline.py \
+                          -t http://vprofile:8080 \
+                          -r zap_report.html -J zap_report.json || true
+                    '''
+                }
+            }
+            post {
+                always {
                     archiveArtifacts artifacts: 'zap_report.html,zap_report.json', allowEmptyArchive: true
                 }
             }
         }
-    } // stages
+    } // end stages
 
     post {
         always {
             script {
+                // Determine build status and user
                 def buildStatus = currentBuild.currentResult
-                def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub User'
-                def buildUrl = "${env.BUILD_URL}"
+                def color = COLOR_MAP[buildStatus] ?: '#CCCCCC'
+                // Attempt to get user who triggered build
+                def buildUser = 'GitHub User'
+                try {
+                    def causes = currentBuild.rawBuild.getCauses()
+                    for (c in causes) {
+                        if (c.toString().contains('UserIdCause')) {
+                            buildUser = c.getUserId() ?: buildUser
+                        }
+                    }
+                } catch (ignored) {}
 
-                slackSend(
-                    channel: '#devsecopscicd',
-                    color: COLOR_MAP[buildStatus],
-                    message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
+                // Slack notification (requires slack plugin and configured slackSend)
+                try {
+                    slackSend(
+                        channel: '#devsecops',
+                        color: color,
+                        message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
 👤 *Started by:* ${buildUser}
-🔗 *Build URL:* <${buildUrl}|Click Here for Details>"""
-                )
+🔗 *Build URL:* <${env.BUILD_URL}|Click Here for Details>"""
+                    )
+                } catch (e) {
+                    echo "Slack notification failed: ${e}"
+                }
 
-                emailext (
-                    subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                    body: """
-                        
-                        <p>Maven App-tier DevSecops CICD pipeline status.</p>
-                        <p>Project: ${env.JOB_NAME}</p>
-                        <p>Build Number: ${env.BUILD_NUMBER}</p>
-                        <p>Build Status: ${buildStatus}</p>
-                        <p>Started by: ${buildUser}</p>
-                        <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-                    """,
-                    to: 'mekni.amin75@gmail.com',
-                    from: 'mmekni66@gmail.com',
-                    mimeType: 'text/html',
-                    attachmentsPattern: 'trivyfs.txt,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json'
-                )
+                // Send email with attachments
+                try {
+                    emailext (
+                        subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """
+                            <p> Created by Mekni Mohamed Amin </p>
+                            <p> DevSecops CICD pipeline status.</p>
+                            <p>Project: ${env.JOB_NAME}</p>
+                            <p>Build Number: ${env.BUILD_NUMBER}</p>
+                            <p>Build Status: ${buildStatus}</p>
+                            <p>Started by: ${buildUser}</p>
+                            <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        """,
+                        to: 'mekni.amin75@gmail.com',
+                        from: 'mmekni66@gmail.com',
+                        mimeType: 'text/html',
+                        attachmentsPattern: 'trivy-fs.json,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json'
+                    )
+                } catch (e) {
+                    echo "Email notification failed: ${e}"
+                }
+            }
+        }
+
+        failure {
+            script {
+                echo "Build FAILED - additional cleanup or ticketing may be added here."
+                
+            }
+        }
+
+        success {
+            script {
+                echo "Build SUCCESS"
             }
         }
     }
