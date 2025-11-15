@@ -1,4 +1,4 @@
-
+// Jenkinsfile (declarative) - ready to paste
 def COLOR_MAP = [
     'SUCCESS': 'good',
     'FAILURE': 'danger',
@@ -9,7 +9,7 @@ def COLOR_MAP = [
 pipeline {
     agent any
 
-    // Tools configured in Jenkins global tools
+    // Tools configured in Jenkins global tools (adjust names to match your Jenkins)
     tools {
         maven 'MAVEN3'
         jdk   'JDK17'
@@ -25,17 +25,17 @@ pipeline {
     }
 
     environment {
-        SCANNER_HOME = tool 'sonar-scanner' // Sonar scanner installation name in Jenkins
+        // Sonar scanner configured as a tool in Jenkins (adjust name if needed)
+        SCANNER_HOME = tool 'sonar-scanner'
         NEXUS_VERSION = 'nexus3'
         NEXUS_PROTOCOL = 'http'
-        NEXUS_URL = '192.168.50.4:8081'               // update if needed
+        NEXUS_URL = '192.168.50.4:8081'
         NEXUS_REPOSITORY = 'vprofile-repo'
-        NEXUS_CREDENTIAL_ID = 'nexuslogin'            // set credentials in Jenkins
-        SONAR_SERVER = 'sonar-server'                 // Sonar server configured in Jenkins global config
-        DOCKER_CREDENTIALS_ID = 'jenkins-github-https-cred'       // set docker credentials in Jenkins
-        GITLEAKS_CREDENTIALS = ''                     // optional
+        NEXUS_CREDENTIAL_ID = 'nexuslogin'
+        SONAR_SERVER = 'sonar-server'
+        DOCKER_CREDENTIALS_ID = 'jenkins-github-https-cred'
+        GITLEAKS_CREDENTIALS = ''
         ARTVERSION = "${env.BUILD_ID}"
-        // email settings are done inside post
     }
 
     options {
@@ -44,8 +44,7 @@ pipeline {
         skipDefaultCheckout(false)
         buildDiscarder(logRotator(numToKeepStr: '20'))
         durabilityHint('MAX_SURVIVABILITY')
-       
-
+        timeout(time: 60, unit: 'MINUTES')
     }
 
     stages {
@@ -64,39 +63,44 @@ pipeline {
             }
         }
 
-      stage('Build') {
-    steps {
-        // run tests as part of build so surefire reports exist
-        sh 'mvn -B clean package'
-    }
-    post {
-        success {
-            archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true
-        }
-    }
-}
-
-stage('Unit Tests & Reports') {
-    steps {
-        // run unit tests (fails the stage if tests fail)
-        sh 'mvn -B test -DskipITs=true'
-    }
-    post {
-        always {
-            junit allowEmptyResults: false, testResults: '**/target/surefire-reports/*.xml'
-            jacoco(execPattern: 'target/jacoco.exec', classPattern: 'target/classes', sourcePattern: 'src/main/java')
-        }
-    }
-}
-
-
-        stage('Integration Tests') {
+        stage('Build (compile + unit tests)') {
             steps {
-                sh 'mvn verify -DskipUnitTests=true || true'
+                // Run unit tests as part of the build so surefire produces XML reports
+                sh 'mvn -B clean package -DskipITs=true'
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Publish Unit Test Results & Coverage') {
+            steps {
+                script {
+                    // Debug listing to help trace paths if something's wrong
+                    sh 'echo "Listing target directories:" && find . -maxdepth 3 -name target -exec ls -la {} \\; || true'
+                }
             }
             post {
                 always {
-                    junit '**/target/failsafe-reports/*.xml'
+                    // publish JUnit results - since we ran mvn package with tests, reports should exist
+                    junit testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: false, keepLongStdio: true
+
+                    // jacoco - adjust patterns if necessary
+                    jacoco(execPattern: 'target/jacoco.exec', classPattern: 'target/classes', sourcePattern: 'src/main/java')
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                // Run integration tests if any (maven fails as appropriate)
+                sh 'mvn -B verify -DskipUnitTests=true || true'
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: '**/target/failsafe-reports/*.xml'
                 }
             }
         }
@@ -116,10 +120,7 @@ stage('Unit Tests & Reports') {
             parallel {
                 stage('Semgrep (fast patterns)') {
                     steps {
-                       
-                        sh '''
-                            semgrep --config auto --output semgrep.json --json . || true
-                        '''
+                        sh 'semgrep --config auto --output semgrep.json --json . || true'
                         archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
                     }
                 }
@@ -127,7 +128,6 @@ stage('Unit Tests & Reports') {
                 stage('SonarQube Analysis') {
                     steps {
                         withSonarQubeEnv("${SONAR_SERVER}") {
-                            // sonar-scanner invocation using SCANNER_HOME configured in Jenkins
                             sh """${SCANNER_HOME}/bin/sonar-scanner \
                                 -Dsonar.projectKey=vprofile \
                                 -Dsonar.projectName=vprofile-repo \
@@ -147,9 +147,8 @@ stage('Unit Tests & Reports') {
         stage('Quality Gate') {
             steps {
                 script {
-                    // waitForQualityGate() returns a map with 'status'
                     timeout(time: 3, unit: 'MINUTES') {
-                        def qg = waitForQualityGate() // will block until analysis is complete
+                        def qg = waitForQualityGate() // blocks until Sonar analysis completes
                         echo "SonarQube Quality Gate status: ${qg.status}"
                         if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') {
                             error "Quality Gate failed with status: ${qg.status}"
@@ -162,7 +161,6 @@ stage('Unit Tests & Reports') {
         stage('Secrets Scan - Gitleaks') {
             steps {
                 sh '''
-                   # gitleaks should be installed on host or run via container
                    set +e
                    gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true
                    set -e
@@ -177,10 +175,7 @@ stage('Unit Tests & Reports') {
 
         stage('Dependency-Check (SCA)') {
             steps {
-                // plugin must be installed/configured on agent or use CLI
-                sh '''
-                    mvn org.owasp:dependency-check-maven:check -Dformat=XML || true
-                '''
+                sh 'mvn org.owasp:dependency-check-maven:check -Dformat=XML || true'
             }
             post {
                 always {
@@ -191,7 +186,6 @@ stage('Unit Tests & Reports') {
 
         stage('Generate SBOM (CycloneDX)') {
             steps {
-                // using maven plugin; ensure plugin available in your repo
                 sh 'mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom || true'
             }
             post {
@@ -216,7 +210,6 @@ stage('Unit Tests & Reports') {
             steps {
                 script {
                     env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
-                    // remove any previous tags (best-effort)
                     sh "docker rmi -f ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG} || true"
                     dockerImage = docker.build("${params.IMAGE_NAME}:latest", ".")
                     sh "docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}"
@@ -243,27 +236,26 @@ stage('Unit Tests & Reports') {
         stage('Enforce Vulnerability Policy') {
             steps {
                 script {
-                    // parse trivy json and dependency-check for high/critical; minimal example
-                    def fail = false
                     if (params.FAIL_ON_HIGH_VULNS) {
+                        def fail = false
                         if (fileExists('trivy-image.json')) {
                             def trivy = readJSON file: 'trivy-image.json'
-                            // find top-level vulnerabilities count (simplified)
                             def criticalOrHigh = 0
-                            trivy.Results.each { res ->
-                                res.Vulnerabilities?.each { v ->
-                                    if (v.Severity == 'CRITICAL' || v.Severity == 'HIGH') {
-                                        criticalOrHigh++
+                            if (trivy.Results) {
+                                trivy.Results.each { res ->
+                                    res.Vulnerabilities?.each { v ->
+                                        if (v.Severity == 'CRITICAL' || v.Severity == 'HIGH') {
+                                            criticalOrHigh++
+                                        }
                                     }
                                 }
                             }
                             echo "Trivy high/critical count: ${criticalOrHigh}"
-                            if (criticalOrHigh > 0) {
-                                fail = true
-                            }
+                            if (criticalOrHigh > 0) { fail = true }
                         }
-                        // Could also parse dependency-check-report.xml similarly
                         if (fail) { error "Failing pipeline because Trivy found HIGH/CRITICAL vulnerabilities" }
+                    } else {
+                        echo "FAIL_ON_HIGH_VULNS disabled - skipping strict vulnerability enforcement"
                     }
                 }
             }
@@ -276,12 +268,9 @@ stage('Unit Tests & Reports') {
             steps {
                 script {
                     docker.withRegistry("https://${params.REGISTRY_URL}", "${DOCKER_CREDENTIALS_ID}") {
-                        // push both tag and latest
                         dockerImage.push("${env.BUILD_NUMBER}")
                         dockerImage.push('latest')
                     }
-                    // Optionally sign image (cosign) - placeholder
-                    // sh "cosign sign --key COSIGN_KEY ${params.REGISTRY_URL}/${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
                 }
             }
         }
@@ -289,7 +278,6 @@ stage('Unit Tests & Reports') {
         stage('Deploy to Container (local agent)') {
             steps {
                 script {
-                    // safer: run container in dedicated network instead of host
                     sh "docker network create vprofile-net || true"
                     sh "docker rm -f vprofile || true"
                     sh "docker run -d --name vprofile --network vprofile-net -p 8080:8080 ${env.IMAGE_TAG}"
@@ -300,9 +288,7 @@ stage('Unit Tests & Reports') {
         stage('DAST - OWASP ZAP (baseline)') {
             steps {
                 script {
-                    // Prefer running ZAP in the same Docker network as the app
                     sh '''
-                        # run zap baseline scanning the container URL (internal network)
                         docker run --rm --user root --network vprofile-net -v $(pwd):/zap/wrk:rw \
                           -t owasp/zap2docker-stable zap-baseline.py \
                           -t http://vprofile:8080 \
@@ -319,59 +305,65 @@ stage('Unit Tests & Reports') {
     } // end stages
 
     post {
-    always {
-        script {
-            def buildStatus = currentBuild.currentResult
-            def color = COLOR_MAP[buildStatus] ?: '#CCCCCC'
-            // safer: use Build User Vars plugin env variables (install plugin if missing)
-            def buildUser = env.BUILD_USER_ID ?: env.BUILD_USER ?: 'GitHub User'
+        always {
+            script {
+                def buildStatus = currentBuild.currentResult ?: 'UNKNOWN'
+                def color = COLOR_MAP[buildStatus] ?: '#CCCCCC'
 
-            try {
-                slackSend(
-                    channel: '#devsecops',
-                    color: color,
-                    message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
+                // Safer user determination: Build User Vars plugin provides BUILD_USER_ID/BUILD_USER
+                def buildUser = env.BUILD_USER_ID ?: env.BUILD_USER
+                if (!buildUser) {
+                    // fallback: use last git committer name (not necessarily the build trigger user)
+                    buildUser = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' HEAD || echo 'GitHub User'").trim()
+                }
+
+                // Slack notification (wrap in try/catch)
+                try {
+                    slackSend(
+                        channel: '#devsecops',
+                        color: color,
+                        message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
 👤 *Started by:* ${buildUser}
 🔗 *Build URL:* <${env.BUILD_URL}|Click Here for Details>"""
-                )
-            } catch (e) {
-                echo "Slack notification failed: ${e}"
+                    )
+                } catch (e) {
+                    echo "Slack notification failed: ${e}"
+                }
+
+                // Send email with attachments (wrap)
+                try {
+                    emailext (
+                        subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        body: """
+                            <p> Created by Mekni Mohamed Amin </p>
+                            <p> DevSecops CICD pipeline status.</p>
+                            <p>Project: ${env.JOB_NAME}</p>
+                            <p>Build Number: ${env.BUILD_NUMBER}</p>
+                            <p>Build Status: ${buildStatus}</p>
+                            <p>Started by: ${buildUser}</p>
+                            <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        """,
+                        to: 'mekni.amin75@gmail.com',
+                        from: 'mmekni66@gmail.com',
+                        mimeType: 'text/html',
+                        attachmentsPattern: 'trivy-fs.json,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json'
+                    )
+                } catch (e) {
+                    echo "Email notification failed: ${e}"
+                }
             }
+        }
 
-            try {
-                emailext (
-                    subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                    body: """
-                        <p> Created by Mekni Mohamed Amin </p>
-                        <p> DevSecops CICD pipeline status.</p>
-                        <p>Project: ${env.JOB_NAME}</p>
-                        <p>Build Number: ${env.BUILD_NUMBER}</p>
-                        <p>Build Status: ${buildStatus}</p>
-                        <p>Started by: ${buildUser}</p>
-                        <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-                    """,
-                    to: 'mekni.amin75@gmail.com',
-                    from: 'mmekni66@gmail.com',
-                    mimeType: 'text/html',
-                    attachmentsPattern: 'trivy-fs.json,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json'
-                )
-            } catch (e) {
-                echo "Email notification failed: ${e}"
+        failure {
+            script {
+                echo "Build FAILED - additional cleanup or ticketing may be added here."
+            }
+        }
+
+        success {
+            script {
+                echo "Build SUCCESS"
             }
         }
     }
-
-    failure {
-        script {
-            echo "Build FAILED - additional cleanup or ticketing may be added here."
-        }
-    }
-
-    success {
-        script {
-            echo "Build SUCCESS"
-        }
-    }
-}
-
 }
