@@ -1,4 +1,4 @@
-// Jenkinsfile - Defensive, ready-to-paste Declarative pipeline
+// Jenkinsfile - Defensive, POSIX-safe, ready-to-paste Declarative pipeline
 def COLOR_MAP = [
     'SUCCESS': 'good',
     'FAILURE': 'danger',
@@ -9,9 +9,8 @@ def COLOR_MAP = [
 pipeline {
     agent any
 
-    // Tools configured in Jenkins global tools - adjust names to your environment
     tools {
-        maven 'MAVEN3'
+        maven 'MAVEN3'   // adjust to your Jenkins tool name
         jdk   'JDK17'
     }
 
@@ -24,9 +23,8 @@ pipeline {
     }
 
     environment {
-        // Set these to match your infra
-        SONAR_HOST_URL = 'http://192.168.50.4:9000'   // <-- change if needed
-        SCANNER_HOME = tool 'sonar-scanner'           // sonar-scanner tool name in Jenkins
+        SONAR_HOST_URL = 'http://192.168.50.4:9000'   // <-- change to your Sonar host URL if needed
+        SCANNER_HOME = tool 'sonar-scanner'           // sonar-scanner tool in Jenkins
         NEXUS_URL = '192.168.50.4:8081'
         NEXUS_REPOSITORY = 'vprofile-repo'
         NEXUS_CREDENTIAL_ID = 'nexuslogin'
@@ -40,7 +38,6 @@ pipeline {
         skipDefaultCheckout(false)
         buildDiscarder(logRotator(numToKeepStr: '20'))
         durabilityHint('MAX_SURVIVABILITY')
-        // pipeline-level timeout (can be overriden per-stage)
         timeout(time: 180, unit: 'MINUTES')
     }
 
@@ -60,43 +57,30 @@ pipeline {
 
         stage('Build (compile + unit tests)') {
             steps {
-                // Run unit tests as part of build (skip integration tests)
                 sh 'mvn -B clean package -DskipITs=true'
             }
             post {
-                success {
-                    archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true
-                }
+                success { archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true }
             }
         }
 
         stage('Publish Unit Test Results & Coverage') {
             steps {
                 script {
-                    // debug listing to verify what exists
                     sh 'echo "Listing top-level target directories:" && find . -maxdepth 3 -name target -exec ls -la {} \\; || true'
                 }
             }
             post {
                 always {
-                    // tolerant: do not abort if no XMLs (your project may have 0 tests)
                     junit testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: true, keepLongStdio: true
-                    // publish jacoco if present (won't fail pipeline if missing)
                     jacoco(execPattern: 'target/jacoco.exec', classPattern: 'target/classes', sourcePattern: 'src/main/java')
                 }
             }
         }
 
         stage('Integration Tests') {
-            steps {
-                // optional: run integration tests; keep non-fatal here
-                sh 'mvn -B verify -DskipUnitTests=true || true'
-            }
-            post {
-                always {
-                    junit testResults: '**/target/failsafe-reports/*.xml', allowEmptyResults: true
-                }
-            }
+            steps { sh 'mvn -B verify -DskipUnitTests=true || true' }
+            post { always { junit testResults: '**/target/failsafe-reports/*.xml', allowEmptyResults: true } }
         }
 
         stage('Code Style - Checkstyle') {
@@ -108,7 +92,6 @@ pipeline {
             parallel {
                 stage('Semgrep (fast patterns)') {
                     steps {
-                        // semgrep may not be installed on agent; keep non-fatal
                         sh 'semgrep --config auto --output semgrep.json --json . || true'
                         archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
                     }
@@ -125,7 +108,6 @@ pipeline {
                                 echo "Sonar health: ${health}"
                             }
 
-                            // Construct sonar-scanner command with explicit host to avoid localhost fallback
                             def scannerCmd = "${SCANNER_HOME}/bin/sonar-scanner " +
                                 "-Dsonar.host.url=${env.SONAR_HOST_URL} " +
                                 "-Dsonar.projectKey=vprofile " +
@@ -137,7 +119,7 @@ pipeline {
                                 "-Dsonar.jacoco.reportPaths=target/jacoco.exec " +
                                 "-Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml"
 
-                            echo "Running Sonar scanner (explicit host) ..."
+                            echo "Running Sonar scanner (explicit host)..."
                             try {
                                 sh scannerCmd
                             } catch (err) {
@@ -154,7 +136,6 @@ pipeline {
         stage('Quality Gate') {
             steps {
                 script {
-                    // Wait for Sonar quality gate if possible; tolerant if wait fails
                     timeout(time: 3, unit: 'MINUTES') {
                         try {
                             def qg = waitForQualityGate()
@@ -182,9 +163,7 @@ pipeline {
         }
 
         stage('Dependency-Check (SCA)') {
-            steps {
-                sh 'mvn org.owasp:dependency-check-maven:check -Dformat=XML || true'
-            }
+            steps { sh 'mvn org.owasp:dependency-check-maven:check -Dformat=XML || true' }
             post { always { archiveArtifacts artifacts: 'target/dependency-check-report.xml', allowEmptyArchive: true } }
         }
 
@@ -202,42 +181,40 @@ pipeline {
             steps {
                 script {
                     env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
-
-                    // Stage-level timeout + retry for Docker builds
                     timeout(time: 45, unit: 'MINUTES') {
                         retry(2) {
-                            // Use a Groovy GString; be sure to escape shell-only $ when needed
                             sh """
-                                set -euo pipefail
+                                # POSIX-safe shell; avoid 'pipefail' which /bin/sh (dash) may not support
+                                set -eu
 
-                                # Enable BuildKit for faster builds
+                                # Enable BuildKit (BuildKit speed is beneficial; keep even if docker ignores it)
                                 export DOCKER_BUILDKIT=1
 
-                                # If Dockerfile exists, parse the base image (first FROM ...)
+                                # Parse base image from Dockerfile (first FROM)
                                 if [ -f Dockerfile ]; then
                                   BASE_IMAGE=\$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
                                 else
                                   BASE_IMAGE=""
                                 fi
 
-                                if [ -n \"\$BASE_IMAGE\" ]; then
-                                  echo \"Pre-pulling base image: \$BASE_IMAGE\"
-                                  docker pull \"\$BASE_IMAGE\" || true
+                                if [ -n "\$BASE_IMAGE" ]; then
+                                  echo "Pre-pulling base image: \$BASE_IMAGE"
+                                  docker pull "\$BASE_IMAGE" || true
                                 else
-                                  echo \"No Dockerfile or no FROM line found — skipping base image pre-pull\"
+                                  echo "No Dockerfile or no FROM line found — skipping base image pre-pull"
                                 fi
 
-                                echo \"Docker info (short):\"
+                                echo "Docker info (short):"
                                 docker info --format '{{json .}}' || true
 
-                                echo \"Building image ${params.IMAGE_NAME}:latest (will tag ${env.IMAGE_TAG})\"
+                                echo "Building image ${params.IMAGE_NAME}:latest (will tag ${env.IMAGE_TAG})"
                                 docker build --network host --progress=plain --pull --cache-from ${params.IMAGE_NAME}:latest -t ${params.IMAGE_NAME}:latest .
 
-                                echo \"Tagging ${params.IMAGE_NAME}:latest -> ${env.IMAGE_TAG}\"
+                                echo "Tagging ${params.IMAGE_NAME}:latest -> ${env.IMAGE_TAG}"
                                 docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}
                             """
-                        } // retry
-                    } // timeout
+                        }
+                    }
                 }
             }
         }
@@ -245,9 +222,8 @@ pipeline {
         stage('Trivy Image Scan') {
             steps {
                 script {
-                    // only attempt if image exists locally
                     sh """
-                        set -euo pipefail
+                        set -eu
                         if docker image inspect ${env.IMAGE_TAG} > /dev/null 2>&1; then
                           trivy image -f json -o trivy-image.json ${env.IMAGE_TAG} || true
                           trivy image -f table -o trivy-image.txt ${env.IMAGE_TAG} || true
@@ -302,7 +278,6 @@ pipeline {
         stage('Deploy to Container (local agent)') {
             steps {
                 script {
-                    // local deploy example -- adjust for your environment
                     sh "docker network create vprofile-net || true"
                     sh "docker rm -f vprofile || true"
                     sh "docker run -d --name vprofile --network vprofile-net -p 8080:8080 ${env.IMAGE_TAG} || true"
@@ -331,13 +306,11 @@ pipeline {
                 def buildStatus = currentBuild.currentResult ?: 'UNKNOWN'
                 def color = COLOR_MAP[buildStatus] ?: '#CCCCCC'
 
-                // Prefer Build User Vars plugin vars, fallback to git committer
                 def buildUser = env.BUILD_USER_ID ?: env.BUILD_USER
                 if (!buildUser) {
                     buildUser = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' HEAD || echo 'GitHub User'").trim()
                 }
 
-                // Slack notification (best-effort)
                 try {
                     slackSend(
                         channel: '#devsecops',
@@ -350,7 +323,6 @@ pipeline {
                     echo "Slack notification failed: ${e}"
                 }
 
-                // Email with artifacts (best-effort)
                 try {
                     emailext (
                         subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
@@ -374,12 +346,7 @@ pipeline {
             }
         }
 
-        failure {
-            script { echo "Build FAILED - consider adding cleanup or ticketing here." }
-        }
-
-        success {
-            script { echo "Build SUCCESS" }
-        }
+        failure { script { echo "Build FAILED - consider adding cleanup or ticketing here." } }
+        success { script { echo "Build SUCCESS" } }
     }
 }
