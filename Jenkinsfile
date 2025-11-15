@@ -174,35 +174,48 @@ pipeline {
             steps { sh 'trivy fs --exit-code 0 --format json -o trivy-fs.json . || true' }
             post { always { archiveArtifacts artifacts: 'trivy-fs.json', allowEmptyArchive: true } }
         }
-
-      stage('Build Docker Image') {
+stage('Build Docker Image') {
     steps {
         script {
             env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
-            // Give this stage more time (adjust minutes as needed)
+            // Increase stage timeout to allow large pulls/builds
             timeout(time: 45, unit: 'MINUTES') {
-                // retry transient failures (2 retries)
+                // retry transient network/download failures
                 retry(2) {
-                    sh '''
-                        # enable BuildKit for faster builds and better caching
+                    // Use GString triple quotes so Groovy expands ${} before sending to shell
+                    sh """
+                        set -euo pipefail
+
+                        # Enable BuildKit for faster builds/caching
                         export DOCKER_BUILDKIT=1
 
-                        # pre-pull the base image(s) referenced in your Dockerfile to avoid long downloads inside build
-                        # replace with the actual base image you use e.g. openjdk:17-jdk or openjdk:17-jdk-slim
-                        docker pull openjdk:17-jdk || true
+                        # Use a valid base image tag. Replace if you use a different base in your Dockerfile.
+                        BASE_IMAGE="eclipse-temurin:17-jdk"
 
-                        # use --network host to avoid DNS issues and sometimes speed up downloads,
-                        # --pull to attempt to get latest base image, --progress=plain for readable logs
-                        # --cache-from attempts to use previous image as cache (push previous image to registry to benefit)
-                        docker build --network host --progress=plain --pull --cache-from ${params.IMAGE_NAME}:latest -t ${params.IMAGE_NAME}:latest .
-                    '''
-                }
-            }
-            // tag the build-specific version
-            sh "docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}"
+                        echo "Pre-pulling base image: ${BASE_IMAGE}"
+                        docker pull ${BASE_IMAGE} || true
+
+                        echo "Docker info (short):"
+                        docker info --format '{{json .}}' || true
+
+                        # Build using host network to avoid DNS issues, readable progress, and cache-from previous image
+                        echo "Building image ${params.IMAGE_NAME}:latest (tag will be ${env.IMAGE_TAG})"
+                        docker build \
+                          --network host \
+                          --progress=plain \
+                          --pull \
+                          --cache-from ${params.IMAGE_NAME}:latest \
+                          -t ${params.IMAGE_NAME}:latest .
+
+                        echo "Tagging image ${params.IMAGE_NAME}:latest -> ${env.IMAGE_TAG}"
+                        docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}
+                    """
+                } // end retry
+            } // end timeout
         }
     }
 }
+
 
 
         stage('Trivy Image Scan') {
