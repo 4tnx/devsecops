@@ -1,9 +1,3 @@
-// Jenkinsfile - final corrected (dollar-sign and escaping fixes)
-// - Triple-double sh blocks with shell $ escaped as \$ where needed
-// - Sonar token bound securely and referenced as \$SONAR_TOKEN inside shell
-// - Trivy limited to vuln scanner (CRITICAL/HIGH) and pipeline fails only on CRITICAL
-// - Sandbox-safe list/loop logic (no rejected closures/methods)
-
 def COLOR_MAP = [
     'SUCCESS': 'good',
     'FAILURE': 'danger',
@@ -62,7 +56,6 @@ pipeline {
 
         stage('Unit Test & Coverage') {
             steps {
-                // keep this single-quoted short command (no Groovy interpolation)
                 sh 'echo "Listing target directories:" && find . -maxdepth 3 -name target -exec ls -la {} \\; || true'
             }
             post {
@@ -84,7 +77,6 @@ pipeline {
                 stage('SonarQube') {
                     steps {
                         script {
-                            // Bind SONAR_TOKEN securely and reference it in shell as $SONAR_TOKEN (escaped in Groovy)
                             withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
                                 withSonarQubeEnv('sonar-server') {
                                     def scanner = "${SCANNER_HOME}/bin/sonar-scanner"
@@ -152,31 +144,29 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-fs.json', allowEmptyArchive: true } }
         }
 
-     stage('Build Docker Image') {
-    steps {
-        script {
-            env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
-            timeout(time: 45, unit: 'MINUTES') {
-                retry(2) {
-                    sh """
-                        set -eu
-                        export DOCKER_BUILDKIT=1
-                        BASE_IMAGE=\\$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
-                        [ -n "\\$BASE_IMAGE" ] && docker pull "\\$BASE_IMAGE" || true
-                        docker build --network host --progress=plain --pull --cache-from ${IMAGE_NAME}:latest -t ${IMAGE_NAME}:latest .
-                        docker tag ${IMAGE_NAME}:latest ${IMAGE_TAG}
-                    """
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
+                    timeout(time: 45, unit: 'MINUTES') {
+                        retry(2) {
+                            sh """
+                                set -eu
+                                export DOCKER_BUILDKIT=1
+                                BASE_IMAGE=\\$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
+                                [ -n "\\$BASE_IMAGE" ] && docker pull "\\$BASE_IMAGE" || true
+                                docker build --network host --progress=plain --pull --cache-from ${params.IMAGE_NAME}:latest -t ${params.IMAGE_NAME}:latest .
+                                docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}
+                            """
+                        }
+                    }
                 }
             }
         }
-    }
-}
-
 
         stage('Trivy Image Scan') {
             steps {
                 script {
-                    // run only vuln scanner and limit severities (json + table)
                     sh """
                         set -eu
                         docker image inspect ${env.IMAGE_TAG} > /dev/null 2>&1
@@ -216,7 +206,6 @@ pipeline {
                         echo "Trivy JSON file not found: ${trivyFile}"
                     }
 
-                    // Tally severities sandbox-safe
                     int critical = 0
                     int high = 0
                     int medium = 0
@@ -233,7 +222,6 @@ pipeline {
                     writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(countsMap)
                     archiveArtifacts artifacts: 'trivy-counts.json', allowEmptyArchive: true
 
-                    // Build human summary sandbox-safe
                     def lines = []
                     lines << "Trivy Vulnerability Summary for ${env.IMAGE_TAG}"
                     lines << "Critical: ${critical}"
@@ -279,7 +267,6 @@ pipeline {
                     writeFile file: 'trivy-summary.txt', text: lines.join('\\n')
                     archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
 
-                    // Enforcement: fail only on CRITICAL
                     if (critical > 0) {
                         error "Pipeline FAILED: CRITICAL vulnerabilities detected (Critical=${critical})"
                     } else {
@@ -364,7 +351,7 @@ pipeline {
                 }
             }
         }
-    } // stages
+    }
 
     post {
         always {
