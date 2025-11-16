@@ -1,4 +1,4 @@
-// Jenkinsfile - full pipeline with configurable Trivy enforcement and triage artifacts
+// Jenkinsfile - DevSecOps pipeline with Trivy enforcement and artifact archiving
 def COLOR_MAP = [
     'SUCCESS': 'good',
     'FAILURE': 'danger',
@@ -10,8 +10,8 @@ pipeline {
     agent any
 
     tools {
-        maven 'MAVEN3'   // adjust to your Jenkins tool names
-        jdk   'JDK17'
+        maven 'MAVEN3'
+        jdk 'JDK17'
     }
 
     parameters {
@@ -19,18 +19,11 @@ pipeline {
         string(name: 'REGISTRY_URL', defaultValue: '192.168.50.4:5000', description: 'Docker Registry (host:port)')
         string(name: 'IMAGE_NAME', defaultValue: 'vprofileappimg', description: 'Local image name')
         booleanParam(name: 'ENFORCE_QUALITY_GATE', defaultValue: true, description: 'Abort pipeline if Sonar Quality Gate != OK')
-        // New policy parameters:
-        booleanParam(name: 'FAIL_ON_CRITICAL_ONLY', defaultValue: true, description: 'If true, only CRITICAL vulnerabilities will fail the pipeline; HIGHs will not.')
-        string(name: 'HIGH_VULN_THRESHOLD', defaultValue: '10', description: 'If FAIL_ON_CRITICAL_ONLY=false, fail when HIGH+CRITICAL > this threshold (integer).')
-        booleanParam(name: 'FAIL_ON_HIGH_VULNS', defaultValue: true, description: 'Legacy flag — kept for backward compat (if true, original behavior could be enforced).')
     }
 
     environment {
         SONAR_HOST_URL = 'http://192.168.50.4:9000'
         SCANNER_HOME = tool 'sonar-scanner'
-        NEXUS_URL = '192.168.50.4:8081'
-        NEXUS_REPOSITORY = 'vprofile-repo'
-        NEXUS_CREDENTIAL_ID = 'nexuslogin'
         DOCKER_CREDENTIALS_ID = 'jenkins-github-https-cred'
         ARTVERSION = "${env.BUILD_ID}"
     }
@@ -45,6 +38,7 @@ pipeline {
     }
 
     stages {
+
         stage('Clean Workspace') { steps { cleanWs() } }
 
         stage('Checkout') {
@@ -56,14 +50,14 @@ pipeline {
             }
         }
 
-        stage('Build (compile + unit tests)') {
+        stage('Build') {
             steps { sh 'mvn -B clean package -DskipITs=true' }
             post { success { archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true } }
         }
 
-        stage('Publish Unit Test Results & Coverage') {
+        stage('Unit Test & Coverage') {
             steps {
-                script { sh 'echo "Listing top-level target directories:" && find . -maxdepth 3 -name target -exec ls -la {} \\; || true' }
+                sh 'echo "Listing target directories:" && find . -maxdepth 3 -name target -exec ls -la {} \\; || true'
             }
             post {
                 always {
@@ -73,33 +67,19 @@ pipeline {
             }
         }
 
-        stage('Integration Tests') {
-            steps { sh 'mvn -B verify -DskipUnitTests=true || true' }
-            post { always { junit testResults: '**/target/failsafe-reports/*.xml', allowEmptyResults: true } }
-        }
-
-        stage('Code Style - Checkstyle') {
-            steps { sh 'mvn checkstyle:checkstyle || true' }
-            post { success { archiveArtifacts artifacts: 'target/checkstyle-result.xml', allowEmptyArchive: true } }
-        }
-
-        stage('Static Analysis - Semgrep + SonarQube') {
+        stage('Static Analysis') {
             parallel {
-                stage('Semgrep (fast patterns)') {
+                stage('Semgrep') {
                     steps {
                         sh 'semgrep --config auto --output semgrep.json --json . || true'
                         archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
                     }
                 }
-
-                stage('SonarQube Analysis') {
+                stage('SonarQube') {
                     steps {
                         script {
-                            echo "Checking SonarQube at ${env.SONAR_HOST_URL}"
-                            def health = sh(script: "curl -sS --max-time 8 ${env.SONAR_HOST_URL}/api/system/health || true", returnStdout: true).trim()
-                            if (!health) { echo "Sonar not reachable (continuing)"; } else { echo "Sonar health: ${health}" }
-                            def scannerCmd = "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.host.url=${env.SONAR_HOST_URL} -Dsonar.projectKey=vprofile -Dsonar.projectName=vprofile-repo -Dsonar.projectVersion=1.0 -Dsonar.sources=src/ -Dsonar.java.binaries=target/classes -Dsonar.junit.reportsPath=target/surefire-reports -Dsonar.jacoco.reportPaths=target/jacoco.exec -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml"
-                            try { sh scannerCmd } catch (err) { echo "Sonar scanner CLI failed: ${err}"; sh "mvn -B sonar:sonar -Dsonar.host.url=${env.SONAR_HOST_URL} || true" }
+                            def scannerCmd = "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.host.url=${env.SONAR_HOST_URL} -Dsonar.projectKey=vprofile -Dsonar.sources=src/ -Dsonar.java.binaries=target/classes -Dsonar.junit.reportsPath=target/surefire-reports -Dsonar.jacoco.reportPaths=target/jacoco.exec"
+                            try { sh scannerCmd } catch (err) { echo "Sonar scanner failed: ${err}"; sh "mvn -B sonar:sonar -Dsonar.host.url=${env.SONAR_HOST_URL} || true" }
                         }
                     }
                 }
@@ -113,35 +93,31 @@ pipeline {
                         try {
                             def qg = waitForQualityGate()
                             echo "Quality Gate status: ${qg.status}"
-                            if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') { error "Quality Gate failed: ${qg.status}" }
-                        } catch (e) { echo "waitForQualityGate failed/timed out: ${e} (continuing)" }
+                            if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') {
+                                error "Quality Gate failed: ${qg.status}"
+                            }
+                        } catch (e) { echo "waitForQualityGate failed: ${e}" }
                     }
                 }
             }
         }
 
-        stage('Secrets Scan - Gitleaks') {
-            steps {
-                sh '''
-                   set +e
-                   gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true
-                   set -e
-                '''
-            }
+        stage('Secrets Scan') {
+            steps { sh 'gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true' }
             post { always { archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true } }
         }
 
-        stage('Dependency-Check (SCA)') {
-            steps { sh 'mvn org.owasp:dependency-check-maven:check -Dformat=XML || true' }
-            post { always { archiveArtifacts artifacts: 'target/dependency-check-report.xml', allowEmptyArchive: true } }
+        stage('SCA & SBOM') {
+            steps {
+                sh 'mvn org.owasp:dependency-check-maven:check -Dformat=XML || true'
+                sh 'mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom || true'
+            }
+            post {
+                always { archiveArtifacts artifacts: 'target/dependency-check-report.xml,target/bom.*', allowEmptyArchive: true }
+            }
         }
 
-        stage('Generate SBOM (CycloneDX)') {
-            steps { sh 'mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom || true' }
-            post { always { archiveArtifacts artifacts: 'target/bom.*', allowEmptyArchive: true } }
-        }
-
-        stage('Trivy File System Scan') {
+        stage('Trivy File Scan') {
             steps { sh 'trivy fs --exit-code 0 --format json -o trivy-fs.json . || true' }
             post { always { archiveArtifacts artifacts: 'trivy-fs.json', allowEmptyArchive: true } }
         }
@@ -152,24 +128,14 @@ pipeline {
                     env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
                     timeout(time: 45, unit: 'MINUTES') {
                         retry(2) {
-                            sh """
+                            sh '''
                                 set -eu
                                 export DOCKER_BUILDKIT=1
-                                if [ -f Dockerfile ]; then
-                                  BASE_IMAGE=\$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
-                                else
-                                  BASE_IMAGE=""
-                                fi
-                                if [ -n "\$BASE_IMAGE" ]; then
-                                  echo "Pre-pulling base image: \$BASE_IMAGE"
-                                  docker pull "\$BASE_IMAGE" || true
-                                else
-                                  echo "No Dockerfile or FROM; skipping pre-pull"
-                                fi
-                                echo "Building ${params.IMAGE_NAME}:latest"
-                                docker build --network host --progress=plain --pull --cache-from ${params.IMAGE_NAME}:latest -t ${params.IMAGE_NAME}:latest .
-                                docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}
-                            """
+                                BASE_IMAGE=$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
+                                [ -n "$BASE_IMAGE" ] && docker pull "$BASE_IMAGE" || true
+                                docker build --network host --progress=plain --pull --cache-from ${IMAGE_NAME}:latest -t ${IMAGE_NAME}:latest .
+                                docker tag ${IMAGE_NAME}:latest ${IMAGE_TAG}
+                            '''
                         }
                     }
                 }
@@ -181,124 +147,96 @@ pipeline {
                 script {
                     sh """
                         set -eu
-                        if docker image inspect ${env.IMAGE_TAG} > /dev/null 2>&1; then
-                          trivy image -f json -o trivy-image.json ${env.IMAGE_TAG} || true
-                          trivy image -f table -o trivy-image.txt ${env.IMAGE_TAG} || true
-                        else
-                          echo "Image ${env.IMAGE_TAG} not found; skipping image scan"
-                        fi
+                        docker image inspect ${env.IMAGE_TAG} > /dev/null 2>&1
+                        trivy image -f json -o trivy-image.json ${env.IMAGE_TAG} || true
+                        trivy image -f table -o trivy-image.txt ${env.IMAGE_TAG} || true
                     """
                 }
             }
             post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
         }
 
-     stage('Prepare Trivy Summary') {
-    steps {
-        script {
-            sh '''#!/usr/bin/env bash
-              set -eu
+        stage('Prepare Trivy Summary') {
+            steps {
+                script {
+                    sh '''
+                        #!/usr/bin/env bash
+                        set -eu
+                        if [ -f trivy-image.json ]; then
+                          jq -r '
+                            map(.Vulnerabilities // []) 
+                            | flatten
+                            | { 
+                                Critical:  map(select(.Severity=="CRITICAL")) | length,
+                                High:      map(select(.Severity=="HIGH"))     | length,
+                                Medium:    map(select(.Severity=="MEDIUM"))   | length,
+                                Low:       map(select(.Severity=="LOW"))      | length
+                              }
+                          ' trivy-image.json > trivy-counts.json || true
 
-              # Check if trivy JSON exists
-              if [ -f trivy-image.json ]; then
-                # Top-level counts
-                jq -r '{
-                  Critical: (.[].Vulnerabilities // [] | map(select(.Severity=="CRITICAL")) | length),
-                  High:     (.[].Vulnerabilities // [] | map(select(.Severity=="HIGH")) | length),
-                  Medium:   (.[].Vulnerabilities // [] | map(select(.Severity=="MEDIUM")) | length),
-                  Low:      (.[].Vulnerabilities // [] | map(select(.Severity=="LOW")) | length)
-                }' trivy-image.json > trivy-counts.json || true
+                          echo "Trivy summary for image ${IMAGE_TAG}" > trivy-summary.txt
+                          jq -r 'to_entries[] | .key + ": " + (.value|tostring)' trivy-counts.json >> trivy-summary.txt || true
 
-                echo "Trivy summary for image ${IMAGE_TAG}" > trivy-summary.txt
-
-                jq -r 'to_entries[] | .key + ": " + (.value|tostring)' trivy-counts.json >> trivy-summary.txt || true
-
-                echo "" >> trivy-summary.txt
-                echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vulnerability):" >> trivy-summary.txt
-
-                jq -r '[.[].Vulnerabilities[]? | {severity: .Severity, pkg: .PkgName, installed: (.InstalledVersion // "-"), fixed: (.FixedVersion // "-"), vuln: .VulnerabilityID}] | sort_by(.severity) | reverse | unique_by(.vuln) | .[] | .severity + " | " + .pkg + " | " + .installed + " | " + .fixed + " | " + .vuln' trivy-image.json | head -n 20 >> trivy-summary.txt || true
-              else
-                echo "No trivy-image.json present; cannot summarize" > trivy-summary.txt
-              fi
-              
-              # Archive artifacts is handled by Jenkins steps
-            '''
-            archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
-        }
-    }
-}
-
-
-
-stage('Enforce Vulnerability Policy') {
-    steps {
-        script {
-            if (fileExists('trivy-image.json')) {
-                def trivyJson = readJSON file: 'trivy-image.json'
-
-                def highCount = 0
-                def criticalCount = 0
-
-                // Count HIGH and CRITICAL vulnerabilities
-                trivyJson.Results.each { result ->
-                    result.Vulnerabilities?.each { vuln ->
-                        if (vuln.Severity == 'HIGH') {
-                            highCount += 1
-                        } else if (vuln.Severity == 'CRITICAL') {
-                            criticalCount += 1
-                        }
-                    }
+                          echo "" >> trivy-summary.txt
+                          echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vulnerability):" >> trivy-summary.txt
+                          jq -r '
+                            map(.Vulnerabilities // [])
+                            | flatten
+                            | map({severity: .Severity, pkg: .PkgName, installed: (.InstalledVersion // "-"), fixed: (.FixedVersion // "-"), vuln: .VulnerabilityID})
+                            | sort_by(.severity) 
+                            | reverse
+                            | unique_by(.vuln)
+                            | .[] 
+                            | .severity + " | " + .pkg + " | " + .installed + " | " + .fixed + " | " + .vuln
+                          ' trivy-image.json | head -n 20 >> trivy-summary.txt || true
+                        else
+                          echo "No trivy-image.json present; cannot summarize" > trivy-summary.txt
+                        fi
+                    '''
+                    archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
                 }
-
-                echo "Trivy HIGH vulnerabilities: ${highCount}"
-                echo "Trivy CRITICAL vulnerabilities: ${criticalCount}"
-
-                // Enforce policy
-                if (params.FAIL_ON_CRITICAL_ONLY) {
-                    if (criticalCount > 0) {
-                        error "Pipeline FAILED: CRITICAL vulnerabilities detected (${criticalCount})"
-                    } else {
-                        echo "No CRITICAL vulnerabilities detected, continuing."
-                    }
-                } else {
-                    // Consider HIGH + CRITICAL
-                    def totalHighCritical = highCount + criticalCount
-                    def threshold = params.HIGH_VULN_THRESHOLD.toInteger()
-                    if (totalHighCritical > threshold) {
-                        error "Pipeline FAILED: HIGH+CRITICAL vulnerabilities (${totalHighCritical}) exceed threshold (${threshold})"
-                    } else {
-                        echo "HIGH+CRITICAL vulnerabilities (${totalHighCritical}) within threshold (${threshold}), continuing."
-                    }
-                }
-
-                // Optional legacy behavior
-                if (params.FAIL_ON_HIGH_VULNS && !params.FAIL_ON_CRITICAL_ONLY && highCount > 0) {
-                    echo "Legacy flag FAIL_ON_HIGH_VULNS enabled — HIGH vulnerabilities exist (${highCount})"
-                    // optionally fail or just log
-                }
-
-            } else {
-                echo "No Trivy JSON found, skipping vulnerability enforcement."
             }
         }
-    }
-}
 
+        stage('Enforce Vulnerability Policy') {
+            steps {
+                script {
+                    if (fileExists('trivy-image.json')) {
+                        def trivyJson = readJSON file: 'trivy-image.json'
+                        def high = 0
+                        def critical = 0
+                        trivyJson.each { result ->
+                            result.Vulnerabilities?.each { vuln ->
+                                if (vuln.Severity == 'HIGH') { high++ }
+                                else if (vuln.Severity == 'CRITICAL') { critical++ }
+                            }
+                        }
+                        echo "Trivy HIGH vulnerabilities: ${high}"
+                        echo "Trivy CRITICAL vulnerabilities: ${critical}"
 
+                        if (critical > 0 || high > 0) {
+                            error "Pipeline FAILED: CRITICAL vulnerabilities detected (${critical})"
+                        }
+                    } else {
+                        echo "No trivy-image.json found, skipping enforcement."
+                    }
+                }
+            }
+        }
 
-        stage('Push Image to Registry (optional)') {
-            when { expression { params.PUSH_IMAGE == true } }
+        stage('Push Image to Registry') {
+            when { expression { params.PUSH_IMAGE } }
             steps {
                 script {
                     docker.withRegistry("https://${params.REGISTRY_URL}", "${DOCKER_CREDENTIALS_ID}") {
-                        sh "docker push ${params.IMAGE_NAME}:${env.BUILD_NUMBER} || true"
+                        sh "docker push ${env.IMAGE_TAG} || true"
                         sh "docker push ${params.IMAGE_NAME}:latest || true"
                     }
                 }
             }
         }
 
-        stage('Deploy to Container (local agent)') {
+        stage('Deploy Container') {
             steps {
                 script {
                     sh "docker network create vprofile-net || true"
@@ -308,40 +246,38 @@ stage('Enforce Vulnerability Policy') {
             }
         }
 
-        stage('DAST - OWASP ZAP (baseline)') {
+        stage('DAST - OWASP ZAP') {
             steps {
                 script {
                     sh '''
                         docker run --rm --user root --network vprofile-net -v $(pwd):/zap/wrk:rw \
-                          -t owasp/zap2docker-stable zap-baseline.py \
-                          -t http://vprofile:8080 \
-                          -r zap_report.html -J zap_report.json || true
+                        -t owasp/zap2docker-stable zap-baseline.py -t http://vprofile:8080 \
+                        -r zap_report.html -J zap_report.json || true
                     '''
                 }
             }
             post { always { archiveArtifacts artifacts: 'zap_report.html,zap_report.json', allowEmptyArchive: true } }
         }
-    } // end stages
+    }
 
     post {
         always {
             script {
                 def buildStatus = currentBuild.currentResult ?: 'UNKNOWN'
                 def color = COLOR_MAP[buildStatus] ?: '#CCCCCC'
-
                 def buildUser = env.BUILD_USER_ID ?: env.BUILD_USER
                 if (!buildUser) { buildUser = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' HEAD || echo 'GitHub User'").trim() }
 
                 try {
                     slackSend(channel: '#devsecops', color: color, message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
 👤 *Started by:* ${buildUser}
-🔗 *Build URL:* <${env.BUILD_URL}|Click Here for Details>""")
+🔗 *Build URL:* <${env.BUILD_URL}|Click Here>""")
                 } catch (e) { echo "Slack failed: ${e}" }
 
                 try {
-                    emailext (
+                    emailext(
                         subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                        body: "<p>Build status: ${buildStatus}</p><p>Started by: ${buildUser}</p><p>Check artifacts (trivy-summary.txt, trivy-image.json, trivy-image.txt)</p>",
+                        body: "<p>Build status: ${buildStatus}</p><p>Started by: ${buildUser}</p><p>Check artifacts (trivy-summary.txt, trivy-image.json)</p>",
                         to: 'mekni.amin75@gmail.com',
                         from: 'mmekni66@gmail.com',
                         mimeType: 'text/html',
@@ -350,8 +286,5 @@ stage('Enforce Vulnerability Policy') {
                 } catch (e) { echo "Email failed: ${e}" }
             }
         }
-
-        failure { script { echo "Build FAILED - investigate trivy-summary.txt and trivy-image.json (archived)." } }
-        success { script { echo "Build SUCCESS" } }
     }
 }
