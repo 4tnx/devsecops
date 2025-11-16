@@ -16,13 +16,13 @@ pipeline {
 
     parameters {
         booleanParam(name: 'PUSH_IMAGE', defaultValue: false, description: 'Push docker image to registry?')
-        string(name: 'REGISTRY_URL', defaultValue: 'localhost:5000', description: 'Docker Registry (host:port)')
+        string(name: 'REGISTRY_URL', defaultValue: 'http://192.168.50.4:5000', description: 'Docker Registry (host:port)')
         string(name: 'IMAGE_NAME', defaultValue: 'vprofileappimg', description: 'Local image name')
         booleanParam(name: 'ENFORCE_QUALITY_GATE', defaultValue: true, description: 'Abort pipeline if Sonar Quality Gate != OK')
     }
 
     environment {
-        SONAR_HOST_URL = 'http://localhost:9000'
+        SONAR_HOST_URL = 'http://192.168.50.4:9000'
         SCANNER_HOME = tool 'sonar-scanner'
         DOCKER_CREDENTIALS_ID = 'jenkins-github-https-cred'
         ARTVERSION = "${env.BUILD_ID}"
@@ -79,9 +79,9 @@ pipeline {
     steps {
         script {
             // ensure you created a Jenkins "Secret text" credential with id 'sonar-token'
-            withCredentials([string(credentialsId: 'sonarqube', variable: 'SONAR_TOKEN')]) {
-                // 'SonarQube' below is the name of the SonarQube server configured in Jenkins (Manage Jenkins -> Configure System -> SonarQube servers)
-                withSonarQubeEnv('SonarQube') {
+            withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+ // 'SonarQube' below is the name of the SonarQube server configured in Jenkins (Manage Jenkins -> Configure System -> SonarQube servers)
+                withSonarQubeEnv('sonar-server') {
                     // Use sonar-scanner if installed, otherwise use mvn sonar:sonar with -Dsonar.login
                     if (fileExists("${SCANNER_HOME}/bin/sonar-scanner")) {
                         sh """
@@ -261,7 +261,7 @@ pipeline {
                 script {
                     sh "docker network create vprofile-net || true"
                     sh "docker rm -f vprofile || true"
-                    sh "docker run -d --name vprofile --network vprofile-net -p 8080:8080 ${env.IMAGE_TAG} || true"
+                    sh "docker run -d --name vprofile --network vprofile-net -p 8081:8081 ${env.IMAGE_TAG} || true"
                 }
             }
         }
