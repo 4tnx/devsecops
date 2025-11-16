@@ -145,25 +145,24 @@ pipeline {
         }
 
         stage('Build Docker Image') {
-    steps {
-        script {
-            env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
-            timeout(time: 45, unit: 'MINUTES') {
-                retry(2) {
-                    sh """
-                        set -eu
-                        export DOCKER_BUILDKIT=1
-                        BASE_IMAGE=\\$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
-                        [ -n "\\$BASE_IMAGE" ] && docker pull "\\$BASE_IMAGE" || true
-                        docker build --network host --progress=plain --pull --cache-from ${params.IMAGE_NAME}:latest -t ${params.IMAGE_NAME}:latest .
-                        docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}
-                    """
+            steps {
+                script {
+                    env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
+                    timeout(time: 45, unit: 'MINUTES') {
+                        retry(2) {
+                            sh """
+                                set -eu
+                                export DOCKER_BUILDKIT=1
+                                BASE_IMAGE=\\$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
+                                [ -n "\\$BASE_IMAGE" ] && docker pull "\\$BASE_IMAGE" || true
+                                docker build --network host --progress=plain --pull --cache-from ${params.IMAGE_NAME}:latest -t ${params.IMAGE_NAME}:latest .
+                                docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}
+                            """
+                        }
+                    }
                 }
             }
         }
-    }
-}
-
 
         stage('Trivy Image Scan') {
             steps {
@@ -187,19 +186,12 @@ pipeline {
 
                     if (fileExists(trivyFile)) {
                         def trivyJson = readJSON file: trivyFile
-                        def results = []
-                        if (trivyJson instanceof Map && trivyJson.containsKey('Results')) {
-                            results = trivyJson.Results
-                        } else if (trivyJson instanceof List) {
-                            results = trivyJson
-                        } else if (trivyJson instanceof Map) {
-                            results = trivyJson.values().findAll { it instanceof Map }
-                        }
+                        def results = trivyJson instanceof Map && trivyJson.containsKey('Results') ? trivyJson.Results :
+                                      trivyJson instanceof List ? trivyJson : trivyJson.values().findAll { it instanceof Map }
 
                         for (r in results) {
                             if (r instanceof Map && r.containsKey('Vulnerabilities')) {
-                                def vs = r['Vulnerabilities'] ?: []
-                                for (v in vs) { vulnerabilities << v }
+                                vulnerabilities.addAll(r['Vulnerabilities'] ?: [])
                             }
                         }
                         echo "Total vulnerabilities found: ${vulnerabilities.size()}"
@@ -207,16 +199,13 @@ pipeline {
                         echo "Trivy JSON file not found: ${trivyFile}"
                     }
 
-                    int critical = 0
-                    int high = 0
-                    int medium = 0
-                    int low = 0
+                    int critical = 0, high = 0, medium = 0, low = 0
                     for (v in vulnerabilities) {
-                        def sev = (v['Severity'] ?: v['severity'])?.toString()?.toUpperCase() ?: 'UNKNOWN'
-                        if (sev == 'CRITICAL') { critical++ }
-                        else if (sev == 'HIGH') { high++ }
-                        else if (sev == 'MEDIUM') { medium++ }
-                        else if (sev == 'LOW') { low++ }
+                        def sev = (v['Severity'] ?: v['severity'])?.toUpperCase() ?: 'UNKNOWN'
+                        if (sev == 'CRITICAL') critical++
+                        else if (sev == 'HIGH') high++
+                        else if (sev == 'MEDIUM') medium++
+                        else if (sev == 'LOW') low++
                     }
 
                     def countsMap = [ Critical: critical, High: high, Medium: medium, Low: low ]
@@ -235,30 +224,29 @@ pipeline {
                         lines << 'Top vulnerabilities:'
                         def buckets = [ 'CRITICAL': [], 'HIGH': [], 'MEDIUM': [], 'LOW': [] ]
                         for (v in vulnerabilities) {
-                            def sev = (v['Severity'] ?: v['severity'])?.toString()?.toUpperCase() ?: 'UNKNOWN'
-                            if (buckets.containsKey(sev)) { buckets[sev] << v }
-                            else { buckets['LOW'] << v }
+                            def sev = (v['Severity'] ?: v['severity'])?.toUpperCase() ?: 'UNKNOWN'
+                            buckets.get(sev, buckets['LOW']) << v
                         }
+
                         def severityOrder = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
                         def topN = []
                         int remaining = 20
                         for (s in severityOrder) {
                             def b = buckets[s]
-                            if (b == null) { continue }
-                            int take = b.size() < remaining ? b.size() : remaining
-                            for (int i = 0; i < take; i++) {
-                                topN << b[i]
-                                remaining = remaining - 1
-                                if (remaining <= 0) { break }
+                            int take = Math.min(b?.size() ?: 0, remaining)
+                            if (take > 0) {
+                                topN.addAll(b[0..<take])
+                                remaining -= take
                             }
-                            if (remaining <= 0) { break }
+                            if (remaining <= 0) break
                         }
+
                         for (vuln in topN) {
-                            def sev = (vuln['Severity'] ?: vuln['severity']) ?: '-'
-                            def pkg = (vuln['PkgName'] ?: vuln['packageName']) ?: '-'
-                            def inst = (vuln['InstalledVersion'] ?: vuln['installedVersion']) ?: '-'
-                            def fix = (vuln['FixedVersion'] ?: vuln['fixedVersion']) ?: '-'
-                            def id  = (vuln['VulnerabilityID'] ?: vuln['id']) ?: '-'
+                            def sev = vuln['Severity'] ?: vuln['severity'] ?: '-'
+                            def pkg = vuln['PkgName'] ?: vuln['packageName'] ?: '-'
+                            def inst = vuln['InstalledVersion'] ?: vuln['installedVersion'] ?: '-'
+                            def fix = vuln['FixedVersion'] ?: vuln['fixedVersion'] ?: '-'
+                            def id  = vuln['VulnerabilityID'] ?: vuln['id'] ?: '-'
                             lines << "${sev} | ${pkg} | ${inst} | ${fix} | ${id}"
                         }
                     } else {
@@ -270,8 +258,9 @@ pipeline {
 
                     if (critical > 0) {
                         error "Pipeline FAILED: CRITICAL vulnerabilities detected (Critical=${critical})"
+                    } else if (high > 0) {
+                        echo "WARNING: ${high} High vulnerabilities found — please triage."
                     } else {
-                        if (high > 0) { echo "WARNING: ${high} High vulnerabilities found — please triage." }
                         echo "✅ Vulnerability policy passed (no CRITICALs)."
                     }
                 }
@@ -320,9 +309,7 @@ pipeline {
 
                     if (fileExists('zap_report.json')) {
                         def zapJson = readJSON file: 'zap_report.json'
-                        int highCount = 0
-                        int mediumCount = 0
-                        int lowCount = 0
+                        int highCount = 0, mediumCount = 0, lowCount = 0
                         if (zapJson instanceof Map && zapJson.containsKey('site')) {
                             def sites = zapJson.site
                             for (s in sites) {
@@ -330,9 +317,9 @@ pipeline {
                                     def alerts = s.alerts
                                     for (a in alerts) {
                                         def risk = a.risk ?: ''
-                                        if (risk == 'High') { highCount++ }
-                                        else if (risk == 'Medium') { mediumCount++ }
-                                        else if (risk == 'Low') { lowCount++ }
+                                        if (risk == 'High') highCount++
+                                        else if (risk == 'Medium') mediumCount++
+                                        else if (risk == 'Low') lowCount++
                                     }
                                 }
                             }
@@ -360,7 +347,9 @@ pipeline {
                 def buildStatus = currentBuild.currentResult ?: 'UNKNOWN'
                 def color = COLOR_MAP[buildStatus] ?: '#CCCCCC'
                 def buildUser = env.BUILD_USER_ID ?: env.BUILD_USER
-                if (!buildUser) { buildUser = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' HEAD || echo 'GitHub User'").trim() }
+                if (!buildUser) {
+                    buildUser = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' HEAD || echo 'GitHub User'").trim()
+                }
 
                 try {
                     slackSend(channel: '#devsecops', color: color, message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
