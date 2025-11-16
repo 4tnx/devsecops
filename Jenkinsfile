@@ -75,32 +75,59 @@ pipeline {
                         archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
                     }
                 }
-                stage('SonarQube') {
-                    steps {
-                        script {
-                            def scannerCmd = "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.host.url=${env.SONAR_HOST_URL} -Dsonar.projectKey=vprofile -Dsonar.sources=src/ -Dsonar.java.binaries=target/classes -Dsonar.junit.reportsPath=target/surefire-reports -Dsonar.jacoco.reportPaths=target/jacoco.exec"
-                            try { sh scannerCmd } catch (err) { echo "Sonar scanner failed: ${err}"; sh "mvn -B sonar:sonar -Dsonar.host.url=${env.SONAR_HOST_URL} || true" }
-                        }
+             stage('SonarQube') {
+    steps {
+        script {
+            // ensure you created a Jenkins "Secret text" credential with id 'sonar-token'
+            withCredentials([string(credentialsId: 'sonarqube', variable: 'SONAR_TOKEN')]) {
+                // 'SonarQube' below is the name of the SonarQube server configured in Jenkins (Manage Jenkins -> Configure System -> SonarQube servers)
+                withSonarQubeEnv('SonarQube') {
+                    // Use sonar-scanner if installed, otherwise use mvn sonar:sonar with -Dsonar.login
+                    if (fileExists("${SCANNER_HOME}/bin/sonar-scanner")) {
+                        sh """
+                            ${SCANNER_HOME}/bin/sonar-scanner \
+                              -Dsonar.host.url=${SONAR_HOST_URL} \
+                              -Dsonar.login=${SONAR_TOKEN} \
+                              -Dsonar.projectKey=vprofile \
+                              -Dsonar.sources=src/ \
+                              -Dsonar.java.binaries=target/classes \
+                              -Dsonar.junit.reportsPath=target/surefire-reports \
+                              -Dsonar.jacoco.reportPaths=target/jacoco.exec
+                        """
+                    } else {
+                        sh "mvn -B sonar:sonar -Dsonar.host.url=${SONAR_HOST_URL} -Dsonar.login=${SONAR_TOKEN} || true"
                     }
-                }
+                } // withSonarQubeEnv
+            } // withCredentials
+        }
+    }
+}
+
             }
         }
 
         stage('Quality Gate') {
-            steps {
-                script {
-                    timeout(time: 3, unit: 'MINUTES') {
-                        try {
-                            def qg = waitForQualityGate()
-                            echo "Quality Gate status: ${qg.status}"
-                            if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') {
-                                error "Quality Gate failed: ${qg.status}"
-                            }
-                        } catch (e) { echo "waitForQualityGate failed: ${e}" }
+    steps {
+        script {
+            timeout(time: 5, unit: 'MINUTES') {
+                try {
+                    def qg = waitForQualityGate()
+                    echo "Quality Gate status: ${qg.status}"
+                    if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') {
+                        error "Quality Gate failed: ${qg.status}"
+                    }
+                } catch (err) {
+                    // If waitForQualityGate throws, print and continue or fail depending on your policy
+                    echo "waitForQualityGate failed: ${err}"
+                    if (params.ENFORCE_QUALITY_GATE) {
+                        error "Could not get quality gate result"
                     }
                 }
             }
         }
+    }
+}
+
 
         stage('Secrets Scan') {
             steps { sh 'gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true' }
