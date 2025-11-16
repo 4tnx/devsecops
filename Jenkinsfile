@@ -183,78 +183,89 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
         }
 
-        stage('Trivy Scan Summary & Enforcement') {
-            steps {
-                script {
-                    def trivyFile = 'trivy-image.json'
-                    def vulnerabilities = []
+       stage('Trivy Scan Summary & Enforcement') {
+    steps {
+        script {
+            def trivyFile = 'trivy-image.json'
+            def vulnerabilities = []
 
-                    if (fileExists(trivyFile)) {
-                        def trivyJson = readJSON file: trivyFile
+            if (fileExists(trivyFile)) {
+                def trivyJson = readJSON file: trivyFile
 
-                        // Trivy JSON can be either an object with 'Results' or a top-level list; handle both
-                        def results = []
-                        if (trivyJson instanceof Map && trivyJson.containsKey('Results')) {
-                            results = trivyJson.Results
-                        } else if (trivyJson instanceof List) {
-                            results = trivyJson
-                        } else if (trivyJson instanceof Map) {
-                            // defensive: some versions may wrap differently
-                            results = trivyJson.values().findAll { it instanceof Map }
-                        }
+                // Trivy JSON can be either an object with 'Results' or a top-level list; handle both
+                def results = []
+                if (trivyJson instanceof Map && trivyJson.containsKey('Results')) {
+                    results = trivyJson.Results
+                } else if (trivyJson instanceof List) {
+                    results = trivyJson
+                } else if (trivyJson instanceof Map) {
+                    results = trivyJson.values().findAll { it instanceof Map }
+                }
 
-                        results.each { r ->
-                            if (r instanceof Map && r.containsKey('Vulnerabilities')) {
-                                vulnerabilities.addAll(r['Vulnerabilities'] ?: [])
-                            }
-                        }
-
-                        echo "Total vulnerabilities found: ${vulnerabilities.size()}"
-                    } else {
-                        echo "Trivy JSON file not found: ${trivyFile}"
-                    }
-
-                    def counts = [
-                        Critical: vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'CRITICAL' },
-                        High:     vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'HIGH' },
-                        Medium:   vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'MEDIUM' },
-                        Low:      vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'LOW' }
-                    ]
-
-                    echo "Trivy Vulnerability Summary:"
-                    counts.each { k, v -> echo "${k}: ${v}" }
-
-                    // Save JSON summary and a small human-readable text summary for email
-                    writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
-
-                    def summaryText = new StringBuilder()
-                    summaryText << "Trivy Vulnerability Summary for ${env.IMAGE_TAG}\n"
-                    counts.each { k, v -> summaryText << "${k}: ${v}\n" }
-
-                    if (vulnerabilities.size() > 0) {
-                        summaryText << '\nTop vulnerabilities:\n'
-                        vulnerabilities.sort { a, b ->
-                            def order = ['CRITICAL':4,'HIGH':3,'MEDIUM':2,'LOW':1]
-                            return (order[(b['Severity']?:b['severity'])?.toString().toUpperCase()]?:0) <=> (order[(a['Severity']?:a['severity'])?.toString().toUpperCase()]?:0)
-                        }.take(20).each { vuln ->
-                            summaryText << "${(vuln['Severity']?:vuln['severity'])?:'-'} | ${vuln['PkgName']?:vuln['packageName']?:'-'} | ${vuln['InstalledVersion']?:vuln['installedVersion']?:'-'} | ${vuln['FixedVersion']?:vuln['fixedVersion']?:'-'} | ${vuln['VulnerabilityID']?:vuln['id']?:'-'}\n"
-                        }
-                    } else {
-                        summaryText << "No vulnerabilities found by Trivy.\n"
-                    }
-
-                    writeFile file: 'trivy-summary.txt', text: summaryText.toString()
-                    archiveArtifacts artifacts: 'trivy-counts.json,trivy-summary.txt', allowEmptyArchive: true
-
-                    // Enforce policy: fail on CRITICAL or HIGH
-                    if ((counts.Critical ?: 0) > 0 || (counts.High ?: 0) > 0) {
-                        error "Pipeline FAILED: CRITICAL/HIGH vulnerabilities detected (Critical=${counts.Critical}, High=${counts.High})"
-                    } else {
-                        echo "✅ Vulnerability policy passed."
+                results.each { r ->
+                    if (r instanceof Map && r.containsKey('Vulnerabilities')) {
+                        vulnerabilities.addAll(r['Vulnerabilities'] ?: [])
                     }
                 }
+
+                echo "Total vulnerabilities found: ${vulnerabilities.size()}"
+            } else {
+                echo "Trivy JSON file not found: ${trivyFile}"
+            }
+
+            def counts = [
+                Critical: vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'CRITICAL' },
+                High:     vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'HIGH' },
+                Medium:   vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'MEDIUM' },
+                Low:      vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'LOW' }
+            ]
+
+            echo "Trivy Vulnerability Summary:"
+            counts.each { k, v -> echo "${k}: ${v}" }
+
+            // Save JSON summary
+            writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
+
+            // Build a human-readable summary using a List to avoid StringBuilder leftShift
+            def lines = []
+            lines << "Trivy Vulnerability Summary for ${env.IMAGE_TAG}"
+            counts.each { k, v -> lines << "${k}: ${v}" }
+
+            if (vulnerabilities.size() > 0) {
+                lines << ''
+                lines << 'Top vulnerabilities:'
+                // Sort and take top 20
+                def ordered = vulnerabilities.sort { a, b ->
+                    def order = ['CRITICAL':4,'HIGH':3,'MEDIUM':2,'LOW':1]
+                    return (order[(b['Severity']?:b['severity'])?.toString().toUpperCase()]?:0) <=> (order[(a['Severity']?:a['severity'])?.toString().toUpperCase()]?:0)
+                }.take(20)
+
+                ordered.each { vuln ->
+                    def sev = (vuln['Severity']?:vuln['severity'])?:'-'
+                    def pkg = (vuln['PkgName']?:vuln['packageName'])?:'-'
+                    def inst = (vuln['InstalledVersion']?:vuln['installedVersion'])?:'-'
+                    def fix = (vuln['FixedVersion']?:vuln['fixedVersion'])?:'-'
+                    def id  = (vuln['VulnerabilityID']?:vuln['id'])?:'-'
+                    lines << "${sev} | ${pkg} | ${inst} | ${fix} | ${id}"
+                }
+            } else {
+                lines << "No vulnerabilities found by Trivy."
+            }
+
+            // Write joined lines (no StringBuilder << usage)
+            writeFile file: 'trivy-summary.txt', text: lines.join('\n')
+            archiveArtifacts artifacts: 'trivy-counts.json,trivy-summary.txt', allowEmptyArchive: true
+
+            // Enforce policy: fail on CRITICAL or HIGH
+            if ((counts.Critical ?: 0) > 0 || (counts.High ?: 0) > 0) {
+                error "Pipeline FAILED: CRITICAL/HIGH vulnerabilities detected (Critical=${counts.Critical}, High=${counts.High})"
+            } else {
+                echo "✅ Vulnerability policy passed."
             }
         }
+    }
+}
+
 
         stage('Push Image to Registry') {
             when { expression { params.PUSH_IMAGE } }
