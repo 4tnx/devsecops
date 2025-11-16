@@ -267,17 +267,51 @@ pipeline {
             }
         }
 
-        stage('DAST - OWASP ZAP') {
+       stage("DAST Scan with OWASP ZAP") {
             steps {
                 script {
-                    sh '''
-                        docker run --rm --user root --network vprofile-net -v $(pwd):/zap/wrk:rw \
-                        -t owasp/zap2docker-stable zap-baseline.py -t http://vprofile:8080 \
-                        -r zap_report.html -J zap_report.json || true
-                    '''
+                    echo '🔍 Running OWASP ZAP baseline scan...'
+
+                    // Run ZAP but ignore exit code
+                    def exitCode = sh(script: '''
+                        docker run --rm --user root --network host -v $(pwd):/zap/wrk:rw \
+                        -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+                        -t http://localhost \
+                        -r zap_report.html -J zap_report.json
+                    ''', returnStatus: true)
+
+                    echo "ZAP scan finished with exit code: ${exitCode}"
+
+                    // Read the JSON report if it exists
+                    if (fileExists('zap_report.json')) {
+                        def zapJson = readJSON file: 'zap_report.json'
+
+                        def highCount = zapJson.site.collect { site ->
+                            site.alerts.findAll { it.risk == 'High' }.size()
+                        }.sum()
+
+                        def mediumCount = zapJson.site.collect { site ->
+                            site.alerts.findAll { it.risk == 'Medium' }.size()
+                        }.sum()
+
+                        def lowCount = zapJson.site.collect { site ->
+                            site.alerts.findAll { it.risk == 'Low' }.size()
+                        }.sum()
+
+                        echo "✅ High severity issues: ${highCount}"
+                        echo "⚠️ Medium severity issues: ${mediumCount}"
+                        echo "ℹ️ Low severity issues: ${lowCount}"
+                    } else {
+                        echo "ZAP JSON report not found, continuing build..."
+                    }
                 }
             }
-            post { always { archiveArtifacts artifacts: 'zap_report.html,zap_report.json', allowEmptyArchive: true } }
+            post {
+                always {
+                    echo '📦 Archiving ZAP scan reports...'
+                    archiveArtifacts artifacts: 'zap_report.html,zap_report.json', allowEmptyArchive: true
+                }
+            }
         }
     }
 
