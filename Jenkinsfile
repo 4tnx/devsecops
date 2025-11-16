@@ -52,7 +52,7 @@ pipeline {
             steps {
                 sh '''
                     echo "Listing target directories:"
-                    find . -maxdepth 3 -name target -exec ls -la {} \;
+                    find . -maxdepth 3 -name target -exec ls -la {} \\;
                 '''
             }
             post {
@@ -150,7 +150,7 @@ pipeline {
                             sh '''
                                 set -eu
                                 export DOCKER_BUILDKIT=1
-                                BASE_IMAGE=$(sed -n 's/^FROM[[:space:]]\+\([^[:space:]]\+\).*/\1/p' Dockerfile | head -n1)
+                                BASE_IMAGE=$(sed -n "s/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p" Dockerfile | head -n1)
                                 if [ -n "$BASE_IMAGE" ]; then
                                     docker pull $BASE_IMAGE || true
                                 fi
@@ -204,19 +204,19 @@ pipeline {
                         
                         // Create detailed summary file
                         def summaryText = """
-                        🔍 TRIVY VULNERABILITY SCAN SUMMARY
+                        TRIVY VULNERABILITY SCAN SUMMARY
                         ===================================
-                        Critical:    ${vulnerabilities.critical} 🚨
-                        High:        ${vulnerabilities.high} ⚠️  
-                        Medium:      ${vulnerabilities.medium} 📝
-                        Low:         ${vulnerabilities.low} ℹ️
+                        Critical:    ${vulnerabilities.critical}
+                        High:        ${vulnerabilities.high}
+                        Medium:      ${vulnerabilities.medium}
+                        Low:         ${vulnerabilities.low}
                         -----------------------------------
                         TOTAL:       ${vulnerabilities.total}
                         
-                        📋 ENFORCEMENT STATUS:
-                        ${vulnerabilities.critical > 0 ? '❌ CRITICAL vulnerabilities detected' : '✅ No critical vulnerabilities'}
-                        ${vulnerabilities.high > 0 ? '⚠️ HIGH vulnerabilities detected' : '✅ No high vulnerabilities'}
-                        ${vulnerabilities.medium > 0 ? '📝 Medium vulnerabilities need review' : '✅ No medium vulnerabilities'}
+                        ENFORCEMENT STATUS:
+                        ${vulnerabilities.critical > 0 ? 'CRITICAL vulnerabilities detected' : 'No critical vulnerabilities'}
+                        ${vulnerabilities.high > 0 ? 'HIGH vulnerabilities detected' : 'No high vulnerabilities'}
+                        ${vulnerabilities.medium > 0 ? 'Medium vulnerabilities need review' : 'No medium vulnerabilities'}
                         """
                         
                         writeFile file: 'trivy-summary.txt', text: summaryText
@@ -225,17 +225,17 @@ pipeline {
                         // Enhanced enforcement logic
                         if (vulnerabilities.critical > 0) {
                             if (env.BRANCH_NAME == 'main') {
-                                error("🚫 PRODUCTION: ${vulnerabilities.critical} CRITICAL vulnerabilities not allowed in main branch")
+                                error("PRODUCTION: ${vulnerabilities.critical} CRITICAL vulnerabilities not allowed in main branch")
                             } else {
                                 unstable("WARNING: ${vulnerabilities.critical} CRITICAL vulnerabilities detected - Build marked unstable but continuing")
                             }
                         } else if (vulnerabilities.high > 10) {
                             unstable("WARNING: ${vulnerabilities.high} HIGH vulnerabilities exceed threshold")
                         } else {
-                            echo "✅ Vulnerability levels within acceptable limits"
+                            echo "Vulnerability levels within acceptable limits"
                         }
                     } else {
-                        echo "⚠️ Trivy report not found, skipping enforcement"
+                        echo "Trivy report not found, skipping enforcement"
                     }
                 }
             }
@@ -249,7 +249,7 @@ pipeline {
         stage('Test Email Configuration') {
             steps {
                 script {
-                    echo "🔧 Testing email configuration..."
+                    echo "Testing email configuration..."
                     
                     // Test 1: Basic mail command
                     try {
@@ -261,9 +261,9 @@ pipeline {
                             Status: ${currentBuild.currentResult}
                             """
                         )
-                        echo "✅ Basic mail() command succeeded"
+                        echo "Basic mail() command succeeded"
                     } catch (Exception e) {
-                        echo "❌ Basic mail() failed: ${e.message}"
+                        echo "Basic mail() failed: ${e.message}"
                     }
                     
                     // Test 2: Email-ext with simple configuration
@@ -278,9 +278,9 @@ pipeline {
                             """,
                             mimeType: 'text/plain'
                         )
-                        echo "✅ Email-ext plugin succeeded"
+                        echo "Email-ext plugin succeeded"
                     } catch (Exception e) {
-                        echo "❌ Email-ext plugin failed: ${e.message}"
+                        echo "Email-ext plugin failed: ${e.message}"
                     }
                 }
             }
@@ -295,8 +295,6 @@ pipeline {
             }
             steps {
                 echo "Image would be pushed to registry for branch: ${env.BRANCH_NAME}"
-                // Add your registry push logic here
-                // sh 'docker push your-registry/vprofileappimg:${BUILD_NUMBER}'
             }
         }
         
@@ -304,44 +302,44 @@ pipeline {
             steps {
                 script {
                     // Cleanup previous deployment
-                    sh '''
+                    sh """
                         docker rm -f vprofile-${BUILD_NUMBER} || true
                         docker network rm vprofile-net-${BUILD_NUMBER} || true
-                    '''
+                    """
                     
                     // Create network and deploy
-                    sh '''
+                    sh """
                         docker network create vprofile-net-${BUILD_NUMBER}
                         docker run -d --name vprofile-${BUILD_NUMBER} --network vprofile-net-${BUILD_NUMBER} -p 8082:8080 vprofileappimg:${BUILD_NUMBER}
-                    '''
+                    """
                     
                     // Wait for container to start
                     sleep 30
                     
                     // Enhanced health check
-                    sh '''
+                    sh """
                         set +x
-                        echo "✅ Container vprofile-${BUILD_NUMBER} is running successfully on port 8082"
+                        echo "Container vprofile-${BUILD_NUMBER} is running successfully on port 8082"
                         
                         # Wait for application to be ready with better health checks
-                        for i in {1..10}; do
+                        for i in 1 2 3 4 5 6 7 8 9 10; do
                             if curl -f http://localhost:8082/ > /dev/null 2>&1; then
-                                echo "✅ Application is responding successfully"
+                                echo "Application is responding successfully"
                                 exit 0
                             elif curl -f http://localhost:8082/health > /dev/null 2>&1; then
-                                echo "✅ Health endpoint is responding"
+                                echo "Health endpoint is responding"
                                 exit 0
                             else
-                                echo "⚠️ Application not responding yet (attempt $i/10)..."
+                                echo "Application not responding yet (attempt \$i/10)..."
                                 sleep 10
                             fi
                         done
                         
-                        echo "❌ Application failed to respond after 10 attempts"
+                        echo "Application failed to respond after 10 attempts"
                         echo "Container logs:"
                         docker logs vprofile-${BUILD_NUMBER}
                         exit 1
-                    '''
+                    """
                 }
             }
         }
@@ -349,23 +347,23 @@ pipeline {
         stage('DAST Scan with OWASP ZAP') {
             steps {
                 script {
-                    echo "🔍 Running OWASP ZAP baseline scan..."
+                    echo "Running OWASP ZAP baseline scan..."
                     
-                    sh '''
+                    sh """
                         if docker inspect -f "{{.State.Status}}" vprofile-${BUILD_NUMBER} | grep -q running; then
-                            echo "✅ Container is running, starting ZAP scan..."
+                            echo "Container is running, starting ZAP scan..."
                         else
-                            echo "❌ Container is not running, cannot perform DAST scan"
+                            echo "Container is not running, cannot perform DAST scan"
                             exit 1
                         fi
-                    '''
+                    """
                     
-                    sh '''
+                    sh """
                         docker run --rm --user root --network host \
-                        -v $(pwd):/zap/wrk:rw \
+                        -v \$(pwd):/zap/wrk:rw \
                         -t ghcr.io/zaproxy/zaproxy:stable \
                         zap-baseline.py -t http://localhost:8082 -r zap_report.html -J zap_report.json -x zap_report.xml || true
-                    '''
+                    """
                     
                     // Analyze ZAP results
                     if (fileExists('zap_report.json')) {
@@ -387,16 +385,16 @@ pipeline {
                         }
                         
                         echo "ZAP Scan Results:"
-                        echo "🔴 High severity issues: ${highIssues}"
-                        echo "🟡 Medium severity issues: ${mediumIssues}"
-                        echo "🔵 Low severity issues: ${lowIssues}"
-                        echo "ℹ️ Informational issues: ${infoIssues}"
+                        echo "High severity issues: ${highIssues}"
+                        echo "Medium severity issues: ${mediumIssues}"
+                        echo "Low severity issues: ${lowIssues}"
+                        echo "Informational issues: ${infoIssues}"
                     }
                 }
             }
             post {
                 always {
-                    echo "📦 Archiving ZAP scan reports..."
+                    echo "Archiving ZAP scan reports..."
                     archiveArtifacts artifacts: 'zap_report.html,zap_report.json,zap_report.xml', fingerprint: false
                 }
             }
@@ -409,7 +407,7 @@ pipeline {
                     def commit = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
                     
                     // Enhanced email with comprehensive reporting
-                    def subject = "${currentBuild.currentResult == 'UNSTABLE' ? '⚠️' : '✅'} ${currentBuild.currentResult}: ${env.JOB_NAME} Build #${env.BUILD_NUMBER}"
+                    def subject = "${currentBuild.currentResult == 'UNSTABLE' ? 'WARNING' : 'SUCCESS'}: ${env.JOB_NAME} Build #${env.BUILD_NUMBER}"
                     
                     def htmlBody = """
                     <html>
@@ -428,14 +426,14 @@ pipeline {
                     </head>
                     <body>
                         <div class="header">
-                            <h2>🚀 DevSecOps Pipeline Execution Report</h2>
+                            <h2>DevSecOps Pipeline Execution Report</h2>
                             <p><strong>Automated Security Scan Results</strong></p>
                         </div>
                         
                         <table>
                             <tr><th>Project</th><td>${env.JOB_NAME}</td></tr>
                             <tr><th>Build Number</th><td>#${env.BUILD_NUMBER}</td></tr>
-                            <tr><th>Status</th><td style="color: ${currentBuild.currentResult == 'SUCCESS' ? 'green' : currentBuild.currentResult == 'UNSTABLE' ? 'orange' : 'red'}">${currentBuild.currentResult}</td></tr>
+                            <tr><th>Status</th><td>${currentBuild.currentResult}</td></tr>
                             <tr><th>Commit</th><td>${commit}</td></tr>
                             <tr><th>Author</th><td>${author}</td></tr>
                             <tr><th>Duration</th><td>${currentBuild.durationString}</td></tr>
@@ -443,19 +441,19 @@ pipeline {
                         </table>
                         
                         <div class="summary">
-                            <h3>📊 Security Scan Summary</h3>
+                            <h3>Security Scan Summary</h3>
                             <table>
                                 <tr><th>Scan Type</th><th>Results</th><th>Status</th></tr>
-                                <tr><td>SAST (Semgrep)</td><td>36 findings</td><td>⚠️ Needs Review</td></tr>
-                                <tr><td>Secrets Detection</td><td>3 secrets found</td><td>❌ Critical</td></tr>
-                                <tr><td>Container Security</td><td>506 vulnerabilities</td><td>❌ Critical</td></tr>
-                                <tr><td>DAST (ZAP)</td><td>4 informational</td><td>⚠️ Warning</td></tr>
-                                <tr><td>SonarQube</td><td>Quality Gate PASSED</td><td>✅ Success</td></tr>
+                                <tr><td>SAST (Semgrep)</td><td>36 findings</td><td>Needs Review</td></tr>
+                                <tr><td>Secrets Detection</td><td>3 secrets found</td><td>Critical</td></tr>
+                                <tr><td>Container Security</td><td>506 vulnerabilities</td><td>Critical</td></tr>
+                                <tr><td>DAST (ZAP)</td><td>4 informational</td><td>Warning</td></tr>
+                                <tr><td>SonarQube</td><td>Quality Gate PASSED</td><td>Success</td></tr>
                             </table>
                         </div>
                         
                         <div class="vulnerability">
-                            <h4>🚨 Critical Issues Requiring Immediate Attention:</h4>
+                            <h4>Critical Issues Requiring Immediate Attention:</h4>
                             <ul>
                                 <li>40 CRITICAL container vulnerabilities detected</li>
                                 <li>3 secrets exposed in codebase</li>
@@ -464,7 +462,7 @@ pipeline {
                         </div>
                         
                         <div class="warning">
-                            <h4>⚠️ Recommended Actions:</h4>
+                            <h4>Recommended Actions:</h4>
                             <ol>
                                 <li>Update vulnerable dependencies (ElasticSearch, Bootstrap, Jackson)</li>
                                 <li>Rotate exposed credentials immediately</li>
@@ -473,7 +471,7 @@ pipeline {
                             </ol>
                         </div>
                         
-                        <p><strong>🔗 Build URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        <p><strong>Build URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
                         <p><em>This is an automated message from Jenkins DevSecOps Pipeline</em></p>
                     </body>
                     </html>
@@ -491,11 +489,11 @@ pipeline {
                     Branch: ${env.BRANCH_NAME}
                     
                     SECURITY SCAN RESULTS:
-                    • SAST (Semgrep): 36 findings
-                    • Secrets Detection: 3 secrets found ❌
-                    • Container Vulnerabilities: 506 total (40 Critical, 205 High) ❌
-                    • DAST (ZAP): 4 informational warnings ⚠️
-                    • SonarQube: Quality Gate PASSED ✅
+                    - SAST (Semgrep): 36 findings
+                    - Secrets Detection: 3 secrets found
+                    - Container Vulnerabilities: 506 total (40 Critical, 205 High)
+                    - DAST (ZAP): 4 informational warnings
+                    - SonarQube: Quality Gate PASSED
                     
                     CRITICAL ISSUES:
                     - 40 CRITICAL container vulnerabilities
@@ -516,9 +514,9 @@ pipeline {
                             replyTo: '$DEFAULT_REPLYTO',
                             from: '$DEFAULT_FROM'
                         )
-                        echo "✅ HTML email notification sent successfully to mekni.amin75@gmail.com"
+                        echo "HTML email notification sent successfully to mekni.amin75@gmail.com"
                     } catch (Exception e) {
-                        echo "❌ HTML email failed: ${e.message}"
+                        echo "HTML email failed: ${e.message}"
                         // Fallback to plain text
                         try {
                             mail(
@@ -526,9 +524,9 @@ pipeline {
                                 subject: subject,
                                 body: textBody
                             )
-                            echo "✅ Plain text fallback email sent successfully"
+                            echo "Plain text fallback email sent successfully"
                         } catch (Exception e2) {
-                            echo "❌ All email methods failed: ${e2.message}"
+                            echo "All email methods failed: ${e2.message}"
                         }
                     }
                 }
@@ -540,10 +538,10 @@ pipeline {
         always {
             script {
                 // Cleanup containers
-                sh '''
+                sh """
                     docker rm -f vprofile-${BUILD_NUMBER} || true
                     docker network rm vprofile-net-${BUILD_NUMBER} || true
-                '''
+                """
                 
                 // Slack notification
                 slackSend(
@@ -560,13 +558,13 @@ pipeline {
             }
         }
         success {
-            echo "🎉 Pipeline executed successfully!"
+            echo "Pipeline executed successfully!"
         }
         unstable {
-            echo "⚠️ Pipeline completed with warnings - security vulnerabilities detected"
+            echo "Pipeline completed with warnings - security vulnerabilities detected"
         }
         failure {
-            echo "❌ Pipeline failed - check logs for details"
+            echo "Pipeline failed - check logs for details"
         }
     }
 }
