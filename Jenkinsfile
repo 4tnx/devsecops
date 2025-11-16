@@ -1,9 +1,8 @@
-// Jenkinsfile - DevSecOps pipeline (final, sandbox-safe, secret-safe, CRITICAL-only enforcement)
-// - SONAR token bound safely (no Groovy interpolation of secret)
-// - Trivy limited to vuln scanner and CRITICAL/HIGH severity, but pipeline fails only on CRITICAL
-// - Trivy summary logic is CPS/sandbox-safe (no rejected methods/closures issues)
-// - Multiline sh blocks use triple quotes with proper escaping
-// - ZAP JSON parsing done with sandbox-safe loops
+// Jenkinsfile - final corrected (dollar-sign and escaping fixes)
+// - Triple-double sh blocks with shell $ escaped as \$ where needed
+// - Sonar token bound securely and referenced as \$SONAR_TOKEN inside shell
+// - Trivy limited to vuln scanner (CRITICAL/HIGH) and pipeline fails only on CRITICAL
+// - Sandbox-safe list/loop logic (no rejected closures/methods)
 
 def COLOR_MAP = [
     'SUCCESS': 'good',
@@ -63,6 +62,7 @@ pipeline {
 
         stage('Unit Test & Coverage') {
             steps {
+                // keep this single-quoted short command (no Groovy interpolation)
                 sh 'echo "Listing target directories:" && find . -maxdepth 3 -name target -exec ls -la {} \\; || true'
             }
             post {
@@ -84,7 +84,7 @@ pipeline {
                 stage('SonarQube') {
                     steps {
                         script {
-                            // Bind SONAR_TOKEN securely and use it only inside the shell as $SONAR_TOKEN
+                            // Bind SONAR_TOKEN securely and reference it in shell as $SONAR_TOKEN (escaped in Groovy)
                             withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
                                 withSonarQubeEnv('sonar-server') {
                                     def scanner = "${SCANNER_HOME}/bin/sonar-scanner"
@@ -175,7 +175,7 @@ pipeline {
         stage('Trivy Image Scan') {
             steps {
                 script {
-                    // Run only vuln scanner, target CRITICAL,HIGH severities (produce JSON and table)
+                    // run only vuln scanner and limit severities (json + table)
                     sh """
                         set -eu
                         docker image inspect ${env.IMAGE_TAG} > /dev/null 2>&1
@@ -195,8 +195,6 @@ pipeline {
 
                     if (fileExists(trivyFile)) {
                         def trivyJson = readJSON file: trivyFile
-
-                        // Handle different trivy JSON shapes
                         def results = []
                         if (trivyJson instanceof Map && trivyJson.containsKey('Results')) {
                             results = trivyJson.Results
@@ -217,7 +215,7 @@ pipeline {
                         echo "Trivy JSON file not found: ${trivyFile}"
                     }
 
-                    // Tally severities (sandbox-safe)
+                    // Tally severities sandbox-safe
                     int critical = 0
                     int high = 0
                     int medium = 0
@@ -230,12 +228,11 @@ pipeline {
                         else if (sev == 'LOW') { low++ }
                     }
 
-                    // Save counts JSON
                     def countsMap = [ Critical: critical, High: high, Medium: medium, Low: low ]
                     writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(countsMap)
                     archiveArtifacts artifacts: 'trivy-counts.json', allowEmptyArchive: true
 
-                    // Build human-readable summary (sandbox-safe)
+                    // Build human summary sandbox-safe
                     def lines = []
                     lines << "Trivy Vulnerability Summary for ${env.IMAGE_TAG}"
                     lines << "Critical: ${critical}"
@@ -246,7 +243,6 @@ pipeline {
                     if (vulnerabilities.size() > 0) {
                         lines << ''
                         lines << 'Top vulnerabilities:'
-                        // Bucket by severity and drain top N = 20 (sandbox-safe)
                         def buckets = [ 'CRITICAL': [], 'HIGH': [], 'MEDIUM': [], 'LOW': [] ]
                         for (v in vulnerabilities) {
                             def sev = (v['Severity'] ?: v['severity'])?.toString()?.toUpperCase() ?: 'UNKNOWN'
@@ -279,16 +275,14 @@ pipeline {
                         lines << "No vulnerabilities found by Trivy."
                     }
 
-                    writeFile file: 'trivy-summary.txt', text: lines.join('\n')
+                    writeFile file: 'trivy-summary.txt', text: lines.join('\\n')
                     archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
 
-                    // Enforcement: fail only on CRITICAL (safer to avoid blocking on many HIGHs while triaging)
+                    // Enforcement: fail only on CRITICAL
                     if (critical > 0) {
                         error "Pipeline FAILED: CRITICAL vulnerabilities detected (Critical=${critical})"
                     } else {
-                        if (high > 0) {
-                            echo "WARNING: ${high} High vulnerabilities found — please triage."
-                        }
+                        if (high > 0) { echo "WARNING: ${high} High vulnerabilities found — please triage." }
                         echo "✅ Vulnerability policy passed (no CRITICALs)."
                     }
                 }
@@ -328,9 +322,9 @@ pipeline {
                     echo '🔍 Running OWASP ZAP baseline scan...'
                     def zapTarget = 'http://localhost:8081'
                     sh """
-                        docker run --rm --user root --network host -v \$(pwd):/zap/wrk:rw \
-                        -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
-                        -t ${zapTarget} \
+                        docker run --rm --user root --network host -v \\$(pwd):/zap/wrk:rw \\
+                        -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \\
+                        -t ${zapTarget} \\
                         -r zap_report.html -J zap_report.json
                     """
                     echo "ZAP scan finished."
