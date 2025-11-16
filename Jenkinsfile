@@ -38,7 +38,11 @@ pipeline {
 
     stages {
 
-        stage('Clean Workspace') { steps { cleanWs() } }
+        stage('Clean Workspace') { 
+            steps { 
+                cleanWs() 
+            } 
+        }
 
         stage('Checkout') {
             steps {
@@ -50,8 +54,14 @@ pipeline {
         }
 
         stage('Build') {
-            steps { sh 'mvn -B clean package -DskipITs=true' }
-            post { success { archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true } }
+            steps { 
+                sh 'mvn -B clean package -DskipITs=true' 
+            }
+            post { 
+                success { 
+                    archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true 
+                } 
+            }
         }
 
         stage('Unit Test & Coverage') {
@@ -125,8 +135,14 @@ pipeline {
         }
 
         stage('Secrets Scan') {
-            steps { sh 'gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true' }
-            post { always { archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true } }
+            steps { 
+                sh 'gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true' 
+            }
+            post { 
+                always { 
+                    archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true 
+                } 
+            }
         }
 
         stage('SCA & SBOM') {
@@ -135,13 +151,21 @@ pipeline {
                 sh 'mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom || true'
             }
             post {
-                always { archiveArtifacts artifacts: 'target/dependency-check-report.xml,target/bom.*', allowEmptyArchive: true }
+                always { 
+                    archiveArtifacts artifacts: 'target/dependency-check-report.xml,target/bom.*', allowEmptyArchive: true 
+                }
             }
         }
 
         stage('Trivy File Scan') {
-            steps { sh 'trivy fs --exit-code 0 --format json -o trivy-fs.json . || true' }
-            post { always { archiveArtifacts artifacts: 'trivy-fs.json', allowEmptyArchive: true } }
+            steps { 
+                sh 'trivy fs --exit-code 0 --format json -o trivy-fs.json . || true' 
+            }
+            post { 
+                always { 
+                    archiveArtifacts artifacts: 'trivy-fs.json', allowEmptyArchive: true 
+                } 
+            }
         }
 
         stage('Build Docker Image') {
@@ -150,14 +174,14 @@ pipeline {
                     env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
                     timeout(time: 45, unit: 'MINUTES') {
                         retry(2) {
-                            sh """
+                            sh '''
                                 set -eu
                                 export DOCKER_BUILDKIT=1
-                                BASE_IMAGE=\\$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
-                                [ -n "\\$BASE_IMAGE" ] && docker pull "\\$BASE_IMAGE" || true
-                                docker build --network host --progress=plain --pull --cache-from ${params.IMAGE_NAME}:latest -t ${params.IMAGE_NAME}:latest .
-                                docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}
-                            """
+                                BASE_IMAGE=$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
+                                [ -n "$BASE_IMAGE" ] && docker pull "$BASE_IMAGE" || true
+                                docker build --network host --progress=plain --pull --cache-from ''' + params.IMAGE_NAME + ''':latest -t ''' + params.IMAGE_NAME + ''':latest .
+                                docker tag ''' + params.IMAGE_NAME + ''':latest ''' + env.IMAGE_TAG + '''
+                            '''
                         }
                     }
                 }
@@ -175,7 +199,11 @@ pipeline {
                     """
                 }
             }
-            post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
+            post { 
+                always { 
+                    archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true 
+                } 
+            }
         }
 
         stage('Trivy Scan Summary & Enforcement') {
@@ -253,7 +281,7 @@ pipeline {
                         lines << "No vulnerabilities found by Trivy."
                     }
 
-                    writeFile file: 'trivy-summary.txt', text: lines.join('\\n')
+                    writeFile file: 'trivy-summary.txt', text: lines.join('\n')
                     archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
 
                     if (critical > 0) {
@@ -268,7 +296,11 @@ pipeline {
         }
 
         stage('Push Image to Registry') {
-            when { expression { params.PUSH_IMAGE } }
+            when { 
+                expression { 
+                    return params.PUSH_IMAGE 
+                } 
+            }
             steps {
                 script {
                     def raw = params.REGISTRY_URL?.trim() ?: ''
@@ -300,7 +332,7 @@ pipeline {
                     echo '🔍 Running OWASP ZAP baseline scan...'
                     def zapTarget = 'http://localhost:8081'
                     sh """
-                        docker run --rm --user root --network host -v \\$(pwd):/zap/wrk:rw \\
+                        docker run --rm --user root --network host -v \$(pwd):/zap/wrk:rw \\
                         -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \\
                         -t ${zapTarget} \\
                         -r zap_report.html -J zap_report.json
@@ -355,7 +387,9 @@ pipeline {
                     slackSend(channel: '#devsecops', color: color, message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
 👤 *Started by:* ${buildUser}
 🔗 *Build URL:* <${env.BUILD_URL}|Click Here>""")
-                } catch (e) { echo "Slack failed: ${e}" }
+                } catch (e) { 
+                    echo "Slack failed: ${e}" 
+                }
 
                 try {
                     emailext(
@@ -366,7 +400,9 @@ pipeline {
                         mimeType: 'text/html',
                         attachmentsPattern: 'trivy-summary.txt,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json'
                     )
-                } catch (e) { echo "Email failed: ${e}" }
+                } catch (e) { 
+                    echo "Email failed: ${e}" 
+                }
             }
         }
     }
