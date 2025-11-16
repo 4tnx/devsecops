@@ -16,13 +16,13 @@ pipeline {
 
     parameters {
         booleanParam(name: 'PUSH_IMAGE', defaultValue: false, description: 'Push docker image to registry?')
-        string(name: 'REGISTRY_URL', defaultValue: '192.168.50.4:5000', description: 'Docker Registry (host:port)')
+        string(name: 'REGISTRY_URL', defaultValue: 'localhost:5000', description: 'Docker Registry (host:port)')
         string(name: 'IMAGE_NAME', defaultValue: 'vprofileappimg', description: 'Local image name')
         booleanParam(name: 'ENFORCE_QUALITY_GATE', defaultValue: true, description: 'Abort pipeline if Sonar Quality Gate != OK')
     }
 
     environment {
-        SONAR_HOST_URL = 'http://192.168.50.4:9000'
+        SONAR_HOST_URL = 'http://localhost:9000'
         SCANNER_HOME = tool 'sonar-scanner'
         DOCKER_CREDENTIALS_ID = 'jenkins-github-https-cred'
         ARTVERSION = "${env.BUILD_ID}"
