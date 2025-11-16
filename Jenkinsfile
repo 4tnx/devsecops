@@ -156,73 +156,70 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
         }
 
-        stage('Prepare Trivy Summary') {
-            steps {
-                script {
-                    sh '''
-                        #!/usr/bin/env bash
-                        set -eu
-                        if [ -f trivy-image.json ]; then
-                          jq -r '
-                            map(.Vulnerabilities // []) 
-                            | flatten
-                            | { 
-                                Critical:  map(select(.Severity=="CRITICAL")) | length,
-                                High:      map(select(.Severity=="HIGH"))     | length,
-                                Medium:    map(select(.Severity=="MEDIUM"))   | length,
-                                Low:       map(select(.Severity=="LOW"))      | length
-                              }
-                          ' trivy-image.json > trivy-counts.json || true
+    stage('Prepare Trivy Summary & Enforce Policy') {
+    steps {
+        script {
+            // --- Read Trivy JSON safely ---
+            def trivyFile = 'trivy-image.json'
+            def vulnerabilities = []
 
-                          echo "Trivy summary for image ${IMAGE_TAG}" > trivy-summary.txt
-                          jq -r 'to_entries[] | .key + ": " + (.value|tostring)' trivy-counts.json >> trivy-summary.txt || true
+            if (fileExists(trivyFile)) {
+                def trivyJson = readJSON file: trivyFile
 
-                          echo "" >> trivy-summary.txt
-                          echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vulnerability):" >> trivy-summary.txt
-                          jq -r '
-                            map(.Vulnerabilities // [])
-                            | flatten
-                            | map({severity: .Severity, pkg: .PkgName, installed: (.InstalledVersion // "-"), fixed: (.FixedVersion // "-"), vuln: .VulnerabilityID})
-                            | sort_by(.severity) 
-                            | reverse
-                            | unique_by(.vuln)
-                            | .[] 
-                            | .severity + " | " + .pkg + " | " + .installed + " | " + .fixed + " | " + .vuln
-                          ' trivy-image.json | head -n 20 >> trivy-summary.txt || true
-                        else
-                          echo "No trivy-image.json present; cannot summarize" > trivy-summary.txt
-                        fi
-                    '''
-                    archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
-                }
-            }
-        }
-
-        stage('Enforce Vulnerability Policy') {
-            steps {
-                script {
-                    if (fileExists('trivy-image.json')) {
-                        def trivyJson = readJSON file: 'trivy-image.json'
-                        def high = 0
-                        def critical = 0
-                        trivyJson.each { result ->
-                            result.Vulnerabilities?.each { vuln ->
-                                if (vuln.Severity == 'HIGH') { high++ }
-                                else if (vuln.Severity == 'CRITICAL') { critical++ }
-                            }
-                        }
-                        echo "Trivy HIGH vulnerabilities: ${high}"
-                        echo "Trivy CRITICAL vulnerabilities: ${critical}"
-
-                        if (critical > 0 || high > 0) {
-                            error "Pipeline FAILED: CRITICAL vulnerabilities detected (${critical})"
-                        }
-                    } else {
-                        echo "No trivy-image.json found, skipping enforcement."
+                // Loop through top-level elements safely
+                trivyJson.each { r ->
+                    if (r instanceof Map && r.containsKey('Vulnerabilities')) {
+                        vulnerabilities.addAll(r.Vulnerabilities ?: [])
                     }
                 }
+            } else {
+                echo "Trivy JSON file not found: ${trivyFile}"
+            }
+
+            // --- Count vulnerabilities by severity ---
+            def counts = [
+                Critical: vulnerabilities.count { it.Severity == 'CRITICAL' },
+                High:     vulnerabilities.count { it.Severity == 'HIGH' },
+                Medium:   vulnerabilities.count { it.Severity == 'MEDIUM' },
+                Low:      vulnerabilities.count { it.Severity == 'LOW' }
+            ]
+
+            // --- Print summary ---
+            echo "Trivy Summary:"
+            counts.each { k, v ->
+                echo "${k}: ${v}"
+            }
+
+            // --- Save summary to file (optional) ---
+            writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
+            archiveArtifacts artifacts: 'trivy-counts.json', allowEmptyArchive: true
+
+            // --- Print top 20 vulnerabilities ---
+            if (vulnerabilities.size() > 0) {
+                echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vuln):"
+                vulnerabilities.sort { a, b ->
+                    // Sort by severity: CRITICAL > HIGH > MEDIUM > LOW
+                    def severityOrder = ['CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1]
+                    return (severityOrder[b.Severity] ?: 0) <=> (severityOrder[a.Severity] ?: 0)
+                }.take(20).each { vuln ->
+                    echo "${vuln.Severity} | ${vuln.PkgName} | ${vuln.InstalledVersion ?: '-'} | ${vuln.FixedVersion ?: '-'} | ${vuln.VulnerabilityID}"
+                }
+            } else {
+                echo "No vulnerabilities found in Trivy scan."
+            }
+
+            // --- Enforce Vulnerability Policy ---
+            if (counts.Critical > 0 || counts.High > 0) {
+                error "Pipeline FAILED: CRITICAL/HIGH vulnerabilities detected (Critical=${counts.Critical}, High=${counts.High})"
+            } else {
+                echo "Vulnerability policy passed."
             }
         }
+    }
+}
+
+
+        
 
         stage('Push Image to Registry') {
             when { expression { params.PUSH_IMAGE } }
