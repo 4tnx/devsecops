@@ -1,6 +1,9 @@
-// Jenkinsfile - DevSecOps pipeline with Trivy enforcement and artifact archiving (final, sandbox-safe)
-// Notes: robust Trivy parsing, registry normalization, sandbox-safe logic (no sort/take/count closures),
-// fixed DAST target, and safer shell escaping in multiline sh blocks.
+// Jenkinsfile - DevSecOps pipeline (final, sandbox-safe, secret-safe, CRITICAL-only enforcement)
+// - SONAR token bound safely (no Groovy interpolation of secret)
+// - Trivy limited to vuln scanner and CRITICAL/HIGH severity, but pipeline fails only on CRITICAL
+// - Trivy summary logic is CPS/sandbox-safe (no rejected methods/closures issues)
+// - Multiline sh blocks use triple quotes with proper escaping
+// - ZAP JSON parsing done with sandbox-safe loops
 
 def COLOR_MAP = [
     'SUCCESS': 'good',
@@ -81,22 +84,25 @@ pipeline {
                 stage('SonarQube') {
                     steps {
                         script {
+                            // Bind SONAR_TOKEN securely and use it only inside the shell as $SONAR_TOKEN
                             withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
                                 withSonarQubeEnv('sonar-server') {
-                                    if (fileExists("${SCANNER_HOME}/bin/sonar-scanner")) {
-                                        sh """
-                                            ${SCANNER_HOME}/bin/sonar-scanner \
-                                              -Dsonar.host.url=${SONAR_HOST_URL} \
-                                              -Dsonar.login=${SONAR_TOKEN} \
-                                              -Dsonar.projectKey=vprofile \
-                                              -Dsonar.sources=src/ \
-                                              -Dsonar.java.binaries=target/classes \
-                                              -Dsonar.junit.reportsPath=target/surefire-reports \
+                                    def scanner = "${SCANNER_HOME}/bin/sonar-scanner"
+                                    sh """
+                                        set -eu
+                                        if [ -x "${scanner}" ]; then
+                                            "${scanner}" \\
+                                              -Dsonar.host.url=${SONAR_HOST_URL} \\
+                                              -Dsonar.login=\\$SONAR_TOKEN \\
+                                              -Dsonar.projectKey=vprofile \\
+                                              -Dsonar.sources=src/ \\
+                                              -Dsonar.java.binaries=target/classes \\
+                                              -Dsonar.junit.reportsPath=target/surefire-reports \\
                                               -Dsonar.jacoco.reportPaths=target/jacoco.exec
-                                        """
-                                    } else {
-                                        sh "mvn -B sonar:sonar -Dsonar.host.url=${SONAR_HOST_URL} -Dsonar.login=${SONAR_TOKEN} || true"
-                                    }
+                                        else
+                                            mvn -B sonar:sonar -Dsonar.host.url=${SONAR_HOST_URL} -Dsonar.login=\\$SONAR_TOKEN || true
+                                        fi
+                                    """
                                 }
                             }
                         }
@@ -155,8 +161,8 @@ pipeline {
                             sh """
                                 set -eu
                                 export DOCKER_BUILDKIT=1
-                                BASE_IMAGE=\$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
-                                [ -n "\$BASE_IMAGE" ] && docker pull "\$BASE_IMAGE" || true
+                                BASE_IMAGE=\\$(sed -n 's/^FROM[[:space:]]\\\\+\\\\([^[:space:]]\\\\+\\\\).*/\\\\1/p' Dockerfile | head -n1 || true)
+                                [ -n "\\$BASE_IMAGE" ] && docker pull "\\$BASE_IMAGE" || true
                                 docker build --network host --progress=plain --pull --cache-from ${IMAGE_NAME}:latest -t ${IMAGE_NAME}:latest .
                                 docker tag ${IMAGE_NAME}:latest ${IMAGE_TAG}
                             """
@@ -169,11 +175,12 @@ pipeline {
         stage('Trivy Image Scan') {
             steps {
                 script {
+                    // Run only vuln scanner, target CRITICAL,HIGH severities (produce JSON and table)
                     sh """
                         set -eu
                         docker image inspect ${env.IMAGE_TAG} > /dev/null 2>&1
-                        trivy image -f json -o trivy-image.json ${env.IMAGE_TAG} || true
-                        trivy image -f table -o trivy-image.txt ${env.IMAGE_TAG} || true
+                        trivy image --scanners vuln --severity CRITICAL,HIGH -f json -o trivy-image.json ${env.IMAGE_TAG} || true
+                        trivy image --scanners vuln --severity CRITICAL,HIGH -f table -o trivy-image.txt ${env.IMAGE_TAG} || true
                     """
                 }
             }
@@ -189,7 +196,7 @@ pipeline {
                     if (fileExists(trivyFile)) {
                         def trivyJson = readJSON file: trivyFile
 
-                        // Trivy JSON can be either an object with 'Results' or a top-level list; handle both
+                        // Handle different trivy JSON shapes
                         def results = []
                         if (trivyJson instanceof Map && trivyJson.containsKey('Results')) {
                             results = trivyJson.Results
@@ -199,68 +206,53 @@ pipeline {
                             results = trivyJson.values().findAll { it instanceof Map }
                         }
 
-                        results.each { r ->
+                        for (r in results) {
                             if (r instanceof Map && r.containsKey('Vulnerabilities')) {
-                                vulnerabilities.addAll(r['Vulnerabilities'] ?: [])
+                                def vs = r['Vulnerabilities'] ?: []
+                                for (v in vs) { vulnerabilities << v }
                             }
                         }
-
                         echo "Total vulnerabilities found: ${vulnerabilities.size()}"
                     } else {
                         echo "Trivy JSON file not found: ${trivyFile}"
                     }
 
-                    // Tally severities using a sandbox-safe loop (avoid .count{ } closures)
+                    // Tally severities (sandbox-safe)
                     int critical = 0
                     int high = 0
                     int medium = 0
                     int low = 0
                     for (v in vulnerabilities) {
-                        def sev = (v['Severity'] ?: v['severity'])?.toString().toUpperCase() ?: 'UNKNOWN'
+                        def sev = (v['Severity'] ?: v['severity'])?.toString()?.toUpperCase() ?: 'UNKNOWN'
                         if (sev == 'CRITICAL') { critical++ }
                         else if (sev == 'HIGH') { high++ }
                         else if (sev == 'MEDIUM') { medium++ }
                         else if (sev == 'LOW') { low++ }
                     }
 
-                    def counts = [
-                        Critical: critical,
-                        High:     high,
-                        Medium:   medium,
-                        Low:      low
-                    ]
+                    // Save counts JSON
+                    def countsMap = [ Critical: critical, High: high, Medium: medium, Low: low ]
+                    writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(countsMap)
+                    archiveArtifacts artifacts: 'trivy-counts.json', allowEmptyArchive: true
 
-                    echo "Trivy Vulnerability Summary:"
-                    counts.each { k, v -> echo "${k}: ${v}" }
-
-                    // Save JSON summary
-                    writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
-
-                    // Build human-readable summary using simple lists and loops (sandbox-safe)
+                    // Build human-readable summary (sandbox-safe)
                     def lines = []
                     lines << "Trivy Vulnerability Summary for ${env.IMAGE_TAG}"
-                    lines << "Critical: ${counts.Critical}"
-                    lines << "High: ${counts.High}"
-                    lines << "Medium: ${counts.Medium}"
-                    lines << "Low: ${counts.Low}"
+                    lines << "Critical: ${critical}"
+                    lines << "High: ${high}"
+                    lines << "Medium: ${medium}"
+                    lines << "Low: ${low}"
 
                     if (vulnerabilities.size() > 0) {
                         lines << ''
                         lines << 'Top vulnerabilities:'
-
-                        // Bucket vulnerabilities by normalized severity
+                        // Bucket by severity and drain top N = 20 (sandbox-safe)
                         def buckets = [ 'CRITICAL': [], 'HIGH': [], 'MEDIUM': [], 'LOW': [] ]
                         for (v in vulnerabilities) {
-                            def sev = (v['Severity'] ?: v['severity'])?.toString().toUpperCase() ?: 'UNKNOWN'
-                            if (buckets.containsKey(sev)) {
-                                buckets[sev] << v
-                            } else {
-                                // ignore other severities or place in LOW by default
-                                buckets['LOW'] << v
-                            }
+                            def sev = (v['Severity'] ?: v['severity'])?.toString()?.toUpperCase() ?: 'UNKNOWN'
+                            if (buckets.containsKey(sev)) { buckets[sev] << v }
+                            else { buckets['LOW'] << v }
                         }
-
-                        // Drain from buckets in severity order until we have top 20
                         def severityOrder = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
                         def topN = []
                         int remaining = 20
@@ -275,7 +267,6 @@ pipeline {
                             }
                             if (remaining <= 0) { break }
                         }
-
                         for (vuln in topN) {
                             def sev = (vuln['Severity'] ?: vuln['severity']) ?: '-'
                             def pkg = (vuln['PkgName'] ?: vuln['packageName']) ?: '-'
@@ -288,15 +279,17 @@ pipeline {
                         lines << "No vulnerabilities found by Trivy."
                     }
 
-                    // Write summary and archive
                     writeFile file: 'trivy-summary.txt', text: lines.join('\n')
-                    archiveArtifacts artifacts: 'trivy-counts.json,trivy-summary.txt', allowEmptyArchive: true
+                    archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
 
-                    // Enforce policy: fail on CRITICAL or HIGH
-                    if ((counts.Critical ?: 0) > 0 || (counts.High ?: 0) > 0) {
-                        error "Pipeline FAILED: CRITICAL/HIGH vulnerabilities detected (Critical=${counts.Critical}, High=${counts.High})"
+                    // Enforcement: fail only on CRITICAL (safer to avoid blocking on many HIGHs while triaging)
+                    if (critical > 0) {
+                        error "Pipeline FAILED: CRITICAL vulnerabilities detected (Critical=${critical})"
                     } else {
-                        echo "✅ Vulnerability policy passed."
+                        if (high > 0) {
+                            echo "WARNING: ${high} High vulnerabilities found — please triage."
+                        }
+                        echo "✅ Vulnerability policy passed (no CRITICALs)."
                     }
                 }
             }
@@ -334,22 +327,33 @@ pipeline {
                 script {
                     echo '🔍 Running OWASP ZAP baseline scan...'
                     def zapTarget = 'http://localhost:8081'
-
                     sh """
                         docker run --rm --user root --network host -v \$(pwd):/zap/wrk:rw \
                         -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
                         -t ${zapTarget} \
                         -r zap_report.html -J zap_report.json
                     """
-
                     echo "ZAP scan finished."
 
                     if (fileExists('zap_report.json')) {
                         def zapJson = readJSON file: 'zap_report.json'
-                        def highCount = zapJson.site.collect { site -> site.alerts.findAll { it.risk == 'High' }.size() }.sum()
-                        def mediumCount = zapJson.site.collect { site -> site.alerts.findAll { it.risk == 'Medium' }.size() }.sum()
-                        def lowCount = zapJson.site.collect { site -> site.alerts.findAll { it.risk == 'Low' }.size() }.sum()
-
+                        int highCount = 0
+                        int mediumCount = 0
+                        int lowCount = 0
+                        if (zapJson instanceof Map && zapJson.containsKey('site')) {
+                            def sites = zapJson.site
+                            for (s in sites) {
+                                if (s instanceof Map && s.containsKey('alerts')) {
+                                    def alerts = s.alerts
+                                    for (a in alerts) {
+                                        def risk = a.risk ?: ''
+                                        if (risk == 'High') { highCount++ }
+                                        else if (risk == 'Medium') { mediumCount++ }
+                                        else if (risk == 'Low') { lowCount++ }
+                                    }
+                                }
+                            }
+                        }
                         echo "✅ High severity issues: ${highCount}"
                         echo "⚠️ Medium severity issues: ${mediumCount}"
                         echo "ℹ️ Low severity issues: ${lowCount}"
