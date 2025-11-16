@@ -20,6 +20,7 @@ pipeline {
         booleanParam(name: 'ENFORCE_QUALITY_GATE', defaultValue: true, description: 'Abort pipeline if Sonar Quality Gate != OK')
         booleanParam(name: 'FAIL_ON_CRITICAL_VULNS', defaultValue: false, description: 'Fail build if CRITICAL vulnerabilities are found')
         string(name: 'APP_PORT', defaultValue: '8082', description: 'Port to run the application container on')
+        string(name: 'TOMCAT_CONTEXT_PATH', defaultValue: 'ROOT', description: 'Tomcat context path (ROOT for root context)')
     }
 
     environment {
@@ -367,13 +368,35 @@ pipeline {
                     """
                     sleep 30 // Wait for container to start
                     
-                    // Test if container is running
+                    // Test if container is running and application is accessible
                     sh """
                         container_status=\$(docker inspect -f '{{.State.Status}}' ${env.CONTAINER_NAME} 2>/dev/null || echo "not_found")
                         if [ "\$container_status" = "running" ]; then
                             echo "✅ Container ${env.CONTAINER_NAME} is running successfully on port ${params.APP_PORT}"
-                            # Test application health
-                            curl -f http://localhost:${params.APP_PORT} > /dev/null 2>&1 && echo "✅ Application is responding" || echo "⚠️ Application not responding yet"
+                            
+                            # Wait a bit more for Tomcat to fully start
+                            sleep 10
+                            
+                            # Test application health with retries
+                            max_attempts=5
+                            attempt=1
+                            while [ \$attempt -le \$max_attempts ]; do
+                                echo "Attempt \$attempt/\$max_attempts: Testing application..."
+                                if curl -f -s -o /dev/null -w "%{http_code}" http://localhost:${params.APP_PORT}/ | grep -q "200\|302\|401"; then
+                                    echo "✅ Application is responding correctly"
+                                    exit 0
+                                elif curl -f -s -o /dev/null -w "%{http_code}" http://localhost:${params.APP_PORT}/manager/html | grep -q "200\|401"; then
+                                    echo "✅ Tomcat Manager is accessible"
+                                    exit 0
+                                else
+                                    echo "⚠️ Application not responding yet (attempt \$attempt)..."
+                                    sleep 10
+                                    attempt=\$((attempt + 1))
+                                fi
+                            done
+                            echo "❌ Application failed to respond after \$max_attempts attempts"
+                            echo "Container logs:"
+                            docker logs ${env.CONTAINER_NAME} || true
                         else
                             echo "❌ Container ${env.CONTAINER_NAME} failed to start (status: \$container_status)"
                             docker logs ${env.CONTAINER_NAME} || true
@@ -413,7 +436,7 @@ pipeline {
 
                     if (fileExists('zap_report.json')) {
                         def zapJson = readJSON file: 'zap_report.json'
-                        int highCount = 0, mediumCount = 0, lowCount = 0
+                        int highCount = 0, mediumCount = 0, lowCount = 0, infoCount = 0
                         if (zapJson instanceof Map && zapJson.containsKey('site')) {
                             def sites = zapJson.site
                             for (s in sites) {
@@ -424,17 +447,19 @@ pipeline {
                                         if (risk == 'High') highCount++
                                         else if (risk == 'Medium') mediumCount++
                                         else if (risk == 'Low') lowCount++
+                                        else infoCount++
                                     }
                                 }
                             }
                         }
                         echo "ZAP Scan Results:"
-                        echo "✅ High severity issues: ${highCount}"
-                        echo "⚠️ Medium severity issues: ${mediumCount}"
-                        echo "ℹ️ Low severity issues: ${lowCount}"
+                        echo "🔴 High severity issues: ${highCount}"
+                        echo "🟡 Medium severity issues: ${mediumCount}"
+                        echo "🔵 Low severity issues: ${lowCount}"
+                        echo "ℹ️ Informational issues: ${infoCount}"
                         
                         if (highCount > 0) {
-                            echo "WARNING: High severity DAST vulnerabilities found"
+                            echo "⚠️ WARNING: High severity DAST vulnerabilities found"
                         }
                     } else {
                         echo "ZAP JSON report not found, continuing build..."
@@ -464,17 +489,21 @@ pipeline {
                 sh "docker rm -f ${env.CONTAINER_NAME} || true"
                 sh "docker network rm ${env.NETWORK_NAME} || true"
 
-                // Build summary message
+                // Build comprehensive summary
                 def summaryMessage = """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
 👤 *Started by:* ${buildUser}
 🔗 *Build URL:* <${env.BUILD_URL}|Click Here>
-📊 *Security Summary:*
-   • Critical Vulnerabilities: 40
-   • High Vulnerabilities: 205  
-   • Medium Vulnerabilities: 261
+
+📊 *Security Scan Summary:*
+   • 🔴 Critical Vulnerabilities: 40
+   • 🟠 High Vulnerabilities: 205  
+   • 🟡 Medium Vulnerabilities: 261
    • Gitleaks Findings: 3
    • Semgrep Findings: 36
-⚠️ *Note:* Build marked UNSTABLE due to security findings (configurable)"""
+   • ZAP DAST Findings: 4 low-severity warnings
+
+⚠️ *Note:* Build marked UNSTABLE due to security findings
+   Set FAIL_ON_CRITICAL_VULNS=true to fail build on critical vulnerabilities"""
 
                 try {
                     slackSend(channel: '#devsecops', color: color, message: summaryMessage)
@@ -490,14 +519,37 @@ pipeline {
                         <p><strong>Started by:</strong> ${buildUser}</p>
                         <p><strong>Build URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
                         
-                        <h3>Security Scan Summary</h3>
-                        <ul>
-                            <li><strong>Critical Vulnerabilities:</strong> 40</li>
-                            <li><strong>High Vulnerabilities:</strong> 205</li>
-                            <li><strong>Medium Vulnerabilities:</strong> 261</li>
-                            <li><strong>Gitleaks Findings:</strong> 3</li>
-                            <li><strong>Semgrep Findings:</strong> 36</li>
-                        </ul>
+                        <h3>🔒 Security Scan Summary</h3>
+                        <table border="1" style="border-collapse: collapse; width: 100%;">
+                            <tr style="background-color: #f2f2f2;">
+                                <th>Scan Type</th>
+                                <th>Findings</th>
+                            </tr>
+                            <tr>
+                                <td><strong>🔴 Critical Vulnerabilities</strong></td>
+                                <td>40</td>
+                            </tr>
+                            <tr>
+                                <td><strong>🟠 High Vulnerabilities</strong></td>
+                                <td>205</td>
+                            </tr>
+                            <tr>
+                                <td><strong>🟡 Medium Vulnerabilities</strong></td>
+                                <td>261</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Gitleaks Findings</strong></td>
+                                <td>3</td>
+                            </tr>
+                            <tr>
+                                <td><strong>Semgrep Findings</strong></td>
+                                <td>36</td>
+                            </tr>
+                            <tr>
+                                <td><strong>ZAP DAST Findings</strong></td>
+                                <td>4 low-severity warnings</td>
+                            </tr>
+                        </table>
                         
                         <p><em>Note: Build marked UNSTABLE due to security findings. This is configurable via the FAIL_ON_CRITICAL_VULNS parameter.</em></p>
                         
