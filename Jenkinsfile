@@ -1,4 +1,7 @@
-// Jenkinsfile - DevSecOps pipeline with Trivy enforcement and artifact archiving
+// Jenkinsfile - DevSecOps pipeline with Trivy enforcement and artifact archiving (improved)
+// Notes: updated Trivy JSON parsing, registry URL normalization, added human-readable trivy summary file,
+// fixed DAST target port, and small robustness improvements.
+
 def COLOR_MAP = [
     'SUCCESS': 'good',
     'FAILURE': 'danger',
@@ -16,7 +19,7 @@ pipeline {
 
     parameters {
         booleanParam(name: 'PUSH_IMAGE', defaultValue: false, description: 'Push docker image to registry?')
-        string(name: 'REGISTRY_URL', defaultValue: 'http://192.168.50.4:5000', description: 'Docker Registry (host:port)')
+        string(name: 'REGISTRY_URL', defaultValue: '192.168.50.4:5000', description: 'Docker Registry (host:port) - do NOT include protocol')
         string(name: 'IMAGE_NAME', defaultValue: 'vprofileappimg', description: 'Local image name')
         booleanParam(name: 'ENFORCE_QUALITY_GATE', defaultValue: true, description: 'Abort pipeline if Sonar Quality Gate != OK')
     }
@@ -75,59 +78,55 @@ pipeline {
                         archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
                     }
                 }
-             stage('SonarQube') {
-    steps {
-        script {
-            // ensure you created a Jenkins "Secret text" credential with id 'sonar-token'
-            withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
- // 'SonarQube' below is the name of the SonarQube server configured in Jenkins (Manage Jenkins -> Configure System -> SonarQube servers)
-                withSonarQubeEnv('sonar-server') {
-                    // Use sonar-scanner if installed, otherwise use mvn sonar:sonar with -Dsonar.login
-                    if (fileExists("${SCANNER_HOME}/bin/sonar-scanner")) {
-                        sh """
-                            ${SCANNER_HOME}/bin/sonar-scanner \
-                              -Dsonar.host.url=${SONAR_HOST_URL} \
-                              -Dsonar.login=${SONAR_TOKEN} \
-                              -Dsonar.projectKey=vprofile \
-                              -Dsonar.sources=src/ \
-                              -Dsonar.java.binaries=target/classes \
-                              -Dsonar.junit.reportsPath=target/surefire-reports \
-                              -Dsonar.jacoco.reportPaths=target/jacoco.exec
-                        """
-                    } else {
-                        sh "mvn -B sonar:sonar -Dsonar.host.url=${SONAR_HOST_URL} -Dsonar.login=${SONAR_TOKEN} || true"
-                    }
-                } // withSonarQubeEnv
-            } // withCredentials
-        }
-    }
-}
-
-            }
-        }
-
-        stage('Quality Gate') {
-    steps {
-        script {
-            timeout(time: 5, unit: 'MINUTES') {
-                try {
-                    def qg = waitForQualityGate()
-                    echo "Quality Gate status: ${qg.status}"
-                    if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') {
-                        error "Quality Gate failed: ${qg.status}"
-                    }
-                } catch (err) {
-                    // If waitForQualityGate throws, print and continue or fail depending on your policy
-                    echo "waitForQualityGate failed: ${err}"
-                    if (params.ENFORCE_QUALITY_GATE) {
-                        error "Could not get quality gate result"
+                stage('SonarQube') {
+                    steps {
+                        script {
+                            // Ensure you created a Jenkins "Secret text" credential with id 'sonar-token'
+                            withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                                // IMPORTANT: make sure the name below matches the SonarQube server configured in Jenkins
+                                withSonarQubeEnv('sonar-server') {
+                                    if (fileExists("${SCANNER_HOME}/bin/sonar-scanner")) {
+                                        sh """
+                                            ${SCANNER_HOME}/bin/sonar-scanner \
+                                              -Dsonar.host.url=${SONAR_HOST_URL} \
+                                              -Dsonar.login=${SONAR_TOKEN} \
+                                              -Dsonar.projectKey=vprofile \
+                                              -Dsonar.sources=src/ \
+                                              -Dsonar.java.binaries=target/classes \
+                                              -Dsonar.junit.reportsPath=target/surefire-reports \
+                                              -Dsonar.jacoco.reportPaths=target/jacoco.exec
+                                        """
+                                    } else {
+                                        sh "mvn -B sonar:sonar -Dsonar.host.url=${SONAR_HOST_URL} -Dsonar.login=${SONAR_TOKEN} || true"
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-    }
-}
 
+        stage('Quality Gate') {
+            steps {
+                script {
+                    timeout(time: 5, unit: 'MINUTES') {
+                        try {
+                            def qg = waitForQualityGate()
+                            echo "Quality Gate status: ${qg.status}"
+                            if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') {
+                                error "Quality Gate failed: ${qg.status}"
+                            }
+                        } catch (err) {
+                            echo "waitForQualityGate failed: ${err}"
+                            if (params.ENFORCE_QUALITY_GATE) {
+                                error "Could not get quality gate result"
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         stage('Secrets Scan') {
             steps { sh 'gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true' }
@@ -158,7 +157,7 @@ pipeline {
                             sh '''
                                 set -eu
                                 export DOCKER_BUILDKIT=1
-                                BASE_IMAGE=$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
+                                BASE_IMAGE=$(sed -n 's/^FROM[[:space:]]\+\([^[:space:]]\+\).*/\1/p' Dockerfile | head -n1 || true)
                                 [ -n "$BASE_IMAGE" ] && docker pull "$BASE_IMAGE" || true
                                 docker build --network host --progress=plain --pull --cache-from ${IMAGE_NAME}:latest -t ${IMAGE_NAME}:latest .
                                 docker tag ${IMAGE_NAME}:latest ${IMAGE_TAG}
@@ -183,72 +182,90 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
         }
 
-   stage('Trivy Scan Summary & Enforcement') {
-    steps {
-        script {
-            def trivyFile = 'trivy-image.json'
-            def vulnerabilities = []
+        stage('Trivy Scan Summary & Enforcement') {
+            steps {
+                script {
+                    def trivyFile = 'trivy-image.json'
+                    def vulnerabilities = []
 
-            if (fileExists(trivyFile)) {
-                def trivyJson = readJSON file: trivyFile
+                    if (fileExists(trivyFile)) {
+                        def trivyJson = readJSON file: trivyFile
 
-                // Safely extract vulnerabilities from each result entry
-                trivyJson.each { r ->
-                    if (r instanceof Map && r.containsKey('Vulnerabilities')) {
-                        vulnerabilities.addAll(r['Vulnerabilities'] ?: [])
+                        // Trivy JSON can be either an object with 'Results' or a top-level list; handle both
+                        def results = []
+                        if (trivyJson instanceof Map && trivyJson.containsKey('Results')) {
+                            results = trivyJson.Results
+                        } else if (trivyJson instanceof List) {
+                            results = trivyJson
+                        } else if (trivyJson instanceof Map) {
+                            // defensive: some versions may wrap differently
+                            results = trivyJson.values().findAll { it instanceof Map }
+                        }
+
+                        results.each { r ->
+                            if (r instanceof Map && r.containsKey('Vulnerabilities')) {
+                                vulnerabilities.addAll(r['Vulnerabilities'] ?: [])
+                            }
+                        }
+
+                        echo "Total vulnerabilities found: ${vulnerabilities.size()}"
+                    } else {
+                        echo "Trivy JSON file not found: ${trivyFile}"
+                    }
+
+                    def counts = [
+                        Critical: vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'CRITICAL' },
+                        High:     vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'HIGH' },
+                        Medium:   vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'MEDIUM' },
+                        Low:      vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'LOW' }
+                    ]
+
+                    echo "Trivy Vulnerability Summary:"
+                    counts.each { k, v -> echo "${k}: ${v}" }
+
+                    // Save JSON summary and a small human-readable text summary for email
+                    writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
+
+                    def summaryText = new StringBuilder()
+                    summaryText << "Trivy Vulnerability Summary for ${env.IMAGE_TAG}\n"
+                    counts.each { k, v -> summaryText << "${k}: ${v}\n" }
+
+                    if (vulnerabilities.size() > 0) {
+                        summaryText << '\nTop vulnerabilities:\n'
+                        vulnerabilities.sort { a, b ->
+                            def order = ['CRITICAL':4,'HIGH':3,'MEDIUM':2,'LOW':1]
+                            return (order[(b['Severity']?:b['severity'])?.toString().toUpperCase()]?:0) <=> (order[(a['Severity']?:a['severity'])?.toString().toUpperCase()]?:0)
+                        }.take(20).each { vuln ->
+                            summaryText << "${(vuln['Severity']?:vuln['severity'])?:'-'} | ${vuln['PkgName']?:vuln['packageName']?:'-'} | ${vuln['InstalledVersion']?:vuln['installedVersion']?:'-'} | ${vuln['FixedVersion']?:vuln['fixedVersion']?:'-'} | ${vuln['VulnerabilityID']?:vuln['id']?:'-'}\n"
+                        }
+                    } else {
+                        summaryText << "No vulnerabilities found by Trivy.\n"
+                    }
+
+                    writeFile file: 'trivy-summary.txt', text: summaryText.toString()
+                    archiveArtifacts artifacts: 'trivy-counts.json,trivy-summary.txt', allowEmptyArchive: true
+
+                    // Enforce policy: fail on CRITICAL or HIGH
+                    if ((counts.Critical ?: 0) > 0 || (counts.High ?: 0) > 0) {
+                        error "Pipeline FAILED: CRITICAL/HIGH vulnerabilities detected (Critical=${counts.Critical}, High=${counts.High})"
+                    } else {
+                        echo "✅ Vulnerability policy passed."
                     }
                 }
-
-                echo "Total vulnerabilities found: ${vulnerabilities.size()}"
-            } else {
-                echo "Trivy JSON file not found: ${trivyFile}"
-            }
-
-            // Count by severity safely using bracket notation
-            def counts = [
-                Critical: vulnerabilities.count { it['Severity'] == 'CRITICAL' },
-                High:     vulnerabilities.count { it['Severity'] == 'HIGH' },
-                Medium:   vulnerabilities.count { it['Severity'] == 'MEDIUM' },
-                Low:      vulnerabilities.count { it['Severity'] == 'LOW' }
-            ]
-
-            // Print summary
-            echo "Trivy Vulnerability Summary:"
-            counts.each { k, v -> echo "${k}: ${v}" }
-
-            // Save summary to JSON file and archive
-            writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
-            archiveArtifacts artifacts: 'trivy-counts.json', allowEmptyArchive: true
-
-            // Print top 20 vulnerabilities
-            if (vulnerabilities.size() > 0) {
-                echo "Top 20 vulnerabilities (Severity | Package | Installed | Fixed | ID):"
-                vulnerabilities.sort { a, b ->
-                    def severityOrder = ['CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1]
-                    return (severityOrder[b['Severity']] ?: 0) <=> (severityOrder[a['Severity']] ?: 0)
-                }.take(20).each { vuln ->
-                    echo "${vuln['Severity']} | ${vuln['PkgName']} | ${vuln['InstalledVersion'] ?: '-'} | ${vuln['FixedVersion'] ?: '-'} | ${vuln['VulnerabilityID']}"
-                }
-            } else {
-                echo "No vulnerabilities found in Trivy scan."
-            }
-
-            // Enforce policy: fail on CRITICAL or HIGH
-            if (counts.Critical > 0 || counts.High > 0) {
-                error "Pipeline FAILED: CRITICAL/HIGH vulnerabilities detected (Critical=${counts.Critical}, High=${counts.High})"
-            } else {
-                echo "✅ Vulnerability policy passed."
             }
         }
-    }
-}
-
 
         stage('Push Image to Registry') {
             when { expression { params.PUSH_IMAGE } }
             steps {
                 script {
-                    docker.withRegistry("https://${params.REGISTRY_URL}", "${DOCKER_CREDENTIALS_ID}") {
+                    // Normalize registry URL (strip protocol if user provided it) and choose http/https as needed
+                    def raw = params.REGISTRY_URL?.trim() ?: ''
+                    def hostport = raw.replaceAll('^https?://', '')
+                    def protocol = (raw.startsWith('https')) ? 'https' : 'http'
+                    def registryWithProto = "${protocol}://${hostport}"
+
+                    docker.withRegistry(registryWithProto, "${DOCKER_CREDENTIALS_ID}") {
                         sh "docker push ${env.IMAGE_TAG} || true"
                         sh "docker push ${params.IMAGE_NAME}:latest || true"
                     }
@@ -261,41 +278,35 @@ pipeline {
                 script {
                     sh "docker network create vprofile-net || true"
                     sh "docker rm -f vprofile || true"
+                    // container exposes 8081 in this pipeline; bind to 8081:8081
                     sh "docker run -d --name vprofile --network vprofile-net -p 8081:8081 ${env.IMAGE_TAG} || true"
                 }
             }
         }
 
-       stage("DAST Scan with OWASP ZAP") {
+        stage("DAST Scan with OWASP ZAP") {
             steps {
                 script {
                     echo '🔍 Running OWASP ZAP baseline scan...'
 
-                    // Run ZAP but ignore exit code
+                    // Use the port the app is actually bound to (8081)
+                    def zapTarget = 'http://localhost:8081'
+
                     def exitCode = sh(script: '''
                         docker run --rm --user root --network host -v $(pwd):/zap/wrk:rw \
                         -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
-                        -t http://localhost \
+                        -t ${ZAP_TARGET:-${zapTarget}} \
                         -r zap_report.html -J zap_report.json
                     ''', returnStatus: true)
 
                     echo "ZAP scan finished with exit code: ${exitCode}"
 
-                    // Read the JSON report if it exists
                     if (fileExists('zap_report.json')) {
                         def zapJson = readJSON file: 'zap_report.json'
 
-                        def highCount = zapJson.site.collect { site ->
-                            site.alerts.findAll { it.risk == 'High' }.size()
-                        }.sum()
-
-                        def mediumCount = zapJson.site.collect { site ->
-                            site.alerts.findAll { it.risk == 'Medium' }.size()
-                        }.sum()
-
-                        def lowCount = zapJson.site.collect { site ->
-                            site.alerts.findAll { it.risk == 'Low' }.size()
-                        }.sum()
+                        def highCount = zapJson.site.collect { site -> site.alerts.findAll { it.risk == 'High' }.size() }.sum()
+                        def mediumCount = zapJson.site.collect { site -> site.alerts.findAll { it.risk == 'Medium' }.size() }.sum()
+                        def lowCount = zapJson.site.collect { site -> site.alerts.findAll { it.risk == 'Low' }.size() }.sum()
 
                         echo "✅ High severity issues: ${highCount}"
                         echo "⚠️ Medium severity issues: ${mediumCount}"
@@ -323,9 +334,7 @@ pipeline {
                 if (!buildUser) { buildUser = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' HEAD || echo 'GitHub User'").trim() }
 
                 try {
-                    slackSend(channel: '#devsecops', color: color, message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
-👤 *Started by:* ${buildUser}
-🔗 *Build URL:* <${env.BUILD_URL}|Click Here>""")
+                    slackSend(channel: '#devsecops', color: color, message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}\n👤 *Started by:* ${buildUser}\n🔗 *Build URL:* <${env.BUILD_URL}|Click Here>""")
                 } catch (e) { echo "Slack failed: ${e}" }
 
                 try {
