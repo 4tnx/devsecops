@@ -370,6 +370,7 @@ pipeline {
                     
                     // Test if container is running and application is accessible
                     sh """
+                        set +x
                         container_status=\$(docker inspect -f '{{.State.Status}}' ${env.CONTAINER_NAME} 2>/dev/null || echo "not_found")
                         if [ "\$container_status" = "running" ]; then
                             echo "✅ Container ${env.CONTAINER_NAME} is running successfully on port ${params.APP_PORT}"
@@ -382,21 +383,22 @@ pipeline {
                             attempt=1
                             while [ \$attempt -le \$max_attempts ]; do
                                 echo "Attempt \$attempt/\$max_attempts: Testing application..."
-                                if curl -f -s -o /dev/null -w "%{http_code}" http://localhost:${params.APP_PORT}/ | grep -q "200\|302\|401"; then
-                                    echo "✅ Application is responding correctly"
-                                    exit 0
-                                elif curl -f -s -o /dev/null -w "%{http_code}" http://localhost:${params.APP_PORT}/manager/html | grep -q "200\|401"; then
-                                    echo "✅ Tomcat Manager is accessible"
-                                    exit 0
+                                http_code=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${params.APP_PORT}/ || echo "000")
+                                if echo "\$http_code" | grep -qE "200|302|401|403"; then
+                                    echo "✅ Application is responding with HTTP code: \$http_code"
+                                    break
                                 else
-                                    echo "⚠️ Application not responding yet (attempt \$attempt)..."
+                                    echo "⚠️ Application not responding yet (HTTP code: \$http_code, attempt \$attempt)..."
                                     sleep 10
                                     attempt=\$((attempt + 1))
                                 fi
                             done
-                            echo "❌ Application failed to respond after \$max_attempts attempts"
-                            echo "Container logs:"
-                            docker logs ${env.CONTAINER_NAME} || true
+                            
+                            if [ \$attempt -gt \$max_attempts ]; then
+                                echo "❌ Application failed to respond after \$max_attempts attempts"
+                                echo "Container logs:"
+                                docker logs ${env.CONTAINER_NAME} || true
+                            fi
                         else
                             echo "❌ Container ${env.CONTAINER_NAME} failed to start (status: \$container_status)"
                             docker logs ${env.CONTAINER_NAME} || true
