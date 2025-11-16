@@ -156,94 +156,66 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
         }
 
-    stage('Prepare Trivy Summary & Enforce Policy') {
+   stage('Trivy Scan Summary & Enforcement') {
     steps {
         script {
-            // --- Read Trivy JSON safely ---
             def trivyFile = 'trivy-image.json'
             def vulnerabilities = []
 
             if (fileExists(trivyFile)) {
                 def trivyJson = readJSON file: trivyFile
 
-                // Loop through top-level elements safely
+                // Safely extract vulnerabilities from each result entry
                 trivyJson.each { r ->
                     if (r instanceof Map && r.containsKey('Vulnerabilities')) {
-                        vulnerabilities.addAll(r.Vulnerabilities ?: [])
+                        vulnerabilities.addAll(r['Vulnerabilities'] ?: [])
                     }
                 }
+
+                echo "Total vulnerabilities found: ${vulnerabilities.size()}"
             } else {
                 echo "Trivy JSON file not found: ${trivyFile}"
             }
 
-            // --- Count vulnerabilities by severity ---
+            // Count by severity safely using bracket notation
             def counts = [
-                Critical: vulnerabilities.count { it.Severity == 'CRITICAL' },
-                High:     vulnerabilities.count { it.Severity == 'HIGH' },
-                Medium:   vulnerabilities.count { it.Severity == 'MEDIUM' },
-                Low:      vulnerabilities.count { it.Severity == 'LOW' }
+                Critical: vulnerabilities.count { it['Severity'] == 'CRITICAL' },
+                High:     vulnerabilities.count { it['Severity'] == 'HIGH' },
+                Medium:   vulnerabilities.count { it['Severity'] == 'MEDIUM' },
+                Low:      vulnerabilities.count { it['Severity'] == 'LOW' }
             ]
 
-            // --- Print summary ---
-            echo "Trivy Summary:"
-            counts.each { k, v ->
-                echo "${k}: ${v}"
-            }
+            // Print summary
+            echo "Trivy Vulnerability Summary:"
+            counts.each { k, v -> echo "${k}: ${v}" }
 
-            // --- Save summary to file (optional) ---
+            // Save summary to JSON file and archive
             writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
             archiveArtifacts artifacts: 'trivy-counts.json', allowEmptyArchive: true
 
-            // --- Print top 20 vulnerabilities ---
+            // Print top 20 vulnerabilities
             if (vulnerabilities.size() > 0) {
-                echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vuln):"
+                echo "Top 20 vulnerabilities (Severity | Package | Installed | Fixed | ID):"
                 vulnerabilities.sort { a, b ->
-                    // Sort by severity: CRITICAL > HIGH > MEDIUM > LOW
                     def severityOrder = ['CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1]
-                    return (severityOrder[b.Severity] ?: 0) <=> (severityOrder[a.Severity] ?: 0)
+                    return (severityOrder[b['Severity']] ?: 0) <=> (severityOrder[a['Severity']] ?: 0)
                 }.take(20).each { vuln ->
-                    echo "${vuln.Severity} | ${vuln.PkgName} | ${vuln.InstalledVersion ?: '-'} | ${vuln.FixedVersion ?: '-'} | ${vuln.VulnerabilityID}"
+                    echo "${vuln['Severity']} | ${vuln['PkgName']} | ${vuln['InstalledVersion'] ?: '-'} | ${vuln['FixedVersion'] ?: '-'} | ${vuln['VulnerabilityID']}"
                 }
             } else {
                 echo "No vulnerabilities found in Trivy scan."
             }
 
-            // --- Enforce Vulnerability Policy ---
+            // Enforce policy: fail on CRITICAL or HIGH
             if (counts.Critical > 0 || counts.High > 0) {
                 error "Pipeline FAILED: CRITICAL/HIGH vulnerabilities detected (Critical=${counts.Critical}, High=${counts.High})"
             } else {
-                echo "Vulnerability policy passed."
+                echo "✅ Vulnerability policy passed."
             }
         }
     }
 }
 
-
-        stage('Enforce Vulnerability Policy') {
-            steps {
-                script {
-                    if (fileExists('trivy-image.json')) {
-                        def trivyJson = readJSON file: 'trivy-image.json'
-                        def high = 0
-                        def critical = 0
-                        trivyJson.each { result ->
-                            result.Vulnerabilities?.each { vuln ->
-                                if (vuln.Severity == 'HIGH') { high++ }
-                                else if (vuln.Severity == 'CRITICAL') { critical++ }
-                            }
-                        }
-                        echo "Trivy HIGH vulnerabilities: ${high}"
-                        echo "Trivy CRITICAL vulnerabilities: ${critical}"
-
-                        if (critical > 0 || high > 0) {
-                            error "Pipeline FAILED: CRITICAL vulnerabilities detected (${critical})"
-                        }
-                    } else {
-                        echo "No trivy-image.json found, skipping enforcement."
-                    }
-                }
-            }
-        }
 
         stage('Push Image to Registry') {
             when { expression { params.PUSH_IMAGE } }
