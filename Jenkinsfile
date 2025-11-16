@@ -1,4 +1,3 @@
-// Jenkinsfile - DevSecOps pipeline with full enforcement and summary
 def COLOR_MAP = [
     'SUCCESS': 'good',
     'FAILURE': 'danger',
@@ -71,26 +70,31 @@ pipeline {
                 stage('Semgrep') {
                     steps {
                         script {
-                            sh 'semgrep --config auto --output semgrep.json --json .'
-
-                            def semgrepData = readJSON file: 'semgrep.json'
-                            def criticalCount = semgrepData.results.count { it.severity == 'ERROR' || it.severity == 'CRITICAL' }
-                            def highCount = semgrepData.results.count { it.severity == 'WARNING' || it.severity == 'HIGH' }
-
-                            echo "Semgrep Summary: Critical=${criticalCount}, High=${highCount}"
-                            archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
-
-                            if (criticalCount > 0 || highCount > 0) {
-                                error "Pipeline FAILED: Semgrep found Critical/High issues."
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                sh 'semgrep --config auto --output semgrep.json --json .'
+                                def semgrepData = readJSON file: 'semgrep.json'
+                                def criticalCount = semgrepData.results.count { it.severity in ['ERROR','CRITICAL'] }
+                                def highCount = semgrepData.results.count { it.severity in ['WARNING','HIGH'] }
+                                echo "Semgrep Summary: Critical=${criticalCount}, High=${highCount}"
+                                archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
+                                if (criticalCount > 0 || highCount > 0) {
+                                    error "Semgrep found Critical/High issues"
+                                }
                             }
                         }
                     }
                 }
+
                 stage('SonarQube') {
                     steps {
                         script {
-                            def scannerCmd = "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.host.url=${env.SONAR_HOST_URL} -Dsonar.projectKey=vprofile -Dsonar.sources=src/ -Dsonar.java.binaries=target/classes -Dsonar.junit.reportsPath=target/surefire-reports -Dsonar.jacoco.reportPaths=target/jacoco.exec"
-                            try { sh scannerCmd } catch (err) { echo "Sonar scanner failed: ${err}"; sh "mvn -B sonar:sonar -Dsonar.host.url=${env.SONAR_HOST_URL} || true" }
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                try {
+                                    sh "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.host.url=${env.SONAR_HOST_URL} -Dsonar.projectKey=vprofile -Dsonar.sources=src/ -Dsonar.java.binaries=target/classes -Dsonar.junit.reportsPath=target/surefire-reports -Dsonar.jacoco.reportPaths=target/jacoco.exec"
+                                } catch (err) {
+                                    echo "Sonar scanner failed: ${err}"
+                                }
+                            }
                         }
                     }
                 }
@@ -114,39 +118,41 @@ pipeline {
         }
 
         stage('Secrets Scan') {
-            steps { sh 'gitleaks detect --source . --report-format json --report-path gitleaks-report.json' }
-            post { always { archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true } }
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    sh 'gitleaks detect --source . --report-format json --report-path gitleaks-report.json'
+                    archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+                }
+            }
         }
 
         stage('SCA & SBOM') {
             steps {
-                sh 'mvn org.owasp:dependency-check-maven:check -Dformat=XML || true'
-                sh 'mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom || true'
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    sh 'mvn org.owasp:dependency-check-maven:check -Dformat=XML || true'
+                    sh 'mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom || true'
+                    archiveArtifacts artifacts: 'target/dependency-check-report.xml,target/bom.*', allowEmptyArchive: true
+                }
             }
-            post { always { archiveArtifacts artifacts: 'target/dependency-check-report.xml,target/bom.*', allowEmptyArchive: true } }
         }
 
         stage('Trivy File Scan') {
             steps {
-                script {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                     sh 'trivy fs --format json -o trivy-fs.json .'
-
                     def trivyFs = readJSON file: 'trivy-fs.json'
                     def vulnerabilities = trivyFs.Vulnerabilities ?: []
-
                     def counts = [
                         Critical: vulnerabilities.count { it.Severity == 'CRITICAL' },
                         High:     vulnerabilities.count { it.Severity == 'HIGH' },
                         Medium:   vulnerabilities.count { it.Severity == 'MEDIUM' },
                         Low:      vulnerabilities.count { it.Severity == 'LOW' }
                     ]
-
                     echo "Trivy FS Summary: ${counts}"
                     writeFile file: 'trivy-fs-counts.json', text: groovy.json.JsonOutput.toJson(counts)
                     archiveArtifacts artifacts: 'trivy-fs.json,trivy-fs-counts.json', allowEmptyArchive: true
-
                     if (counts.Critical > 0 || counts.High > 0) {
-                        error "Pipeline FAILED: Trivy FS found Critical/High vulnerabilities."
+                        error "Trivy FS found Critical/High vulnerabilities"
                     }
                 }
             }
@@ -156,17 +162,15 @@ pipeline {
             steps {
                 script {
                     env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
-                    timeout(time: 45, unit: 'MINUTES') {
-                        retry(2) {
-                            sh '''
-                                set -eu
-                                export DOCKER_BUILDKIT=1
-                                BASE_IMAGE=$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
-                                [ -n "$BASE_IMAGE" ] && docker pull "$BASE_IMAGE" || true
-                                docker build --network host --progress=plain --pull --cache-from ${IMAGE_NAME}:latest -t ${IMAGE_NAME}:latest .
-                                docker tag ${IMAGE_NAME}:latest ${IMAGE_TAG}
-                            '''
-                        }
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        sh '''
+                            set -eu
+                            export DOCKER_BUILDKIT=1
+                            BASE_IMAGE=$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
+                            [ -n "$BASE_IMAGE" ] && docker pull "$BASE_IMAGE" || true
+                            docker build --network host --progress=plain --pull --cache-from ${IMAGE_NAME}:latest -t ${IMAGE_NAME}:latest .
+                            docker tag ${IMAGE_NAME}:latest ${IMAGE_TAG}
+                        '''
                     }
                 }
             }
@@ -174,16 +178,16 @@ pipeline {
 
         stage('Trivy Image Scan') {
             steps {
-                script {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                     sh """
                         set -eu
                         docker image inspect ${env.IMAGE_TAG} > /dev/null 2>&1
                         trivy image -f json -o trivy-image.json ${env.IMAGE_TAG} || true
                         trivy image -f table -o trivy-image.txt ${env.IMAGE_TAG} || true
                     """
+                    archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true
                 }
             }
-            post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
         }
 
         stage('Prepare Trivy Summary & Enforce Policy') {
@@ -191,7 +195,6 @@ pipeline {
                 script {
                     def trivyFile = 'trivy-image.json'
                     def vulnerabilities = []
-
                     if (fileExists(trivyFile)) {
                         def trivyJson = readJSON file: trivyFile
                         trivyJson.each { r ->
@@ -199,21 +202,18 @@ pipeline {
                                 vulnerabilities.addAll(r.Vulnerabilities ?: [])
                             }
                         }
-                    } else { echo "Trivy JSON file not found: ${trivyFile}" }
-
+                    }
                     def counts = [
                         Critical: vulnerabilities.count { it.Severity == 'CRITICAL' },
                         High:     vulnerabilities.count { it.Severity == 'HIGH' },
                         Medium:   vulnerabilities.count { it.Severity == 'MEDIUM' },
                         Low:      vulnerabilities.count { it.Severity == 'LOW' }
                     ]
-
                     echo "Trivy Image Summary: ${counts}"
                     writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
                     archiveArtifacts artifacts: 'trivy-counts.json', allowEmptyArchive: true
-
                     if (counts.Critical > 0 || counts.High > 0) {
-                        error "Pipeline FAILED: CRITICAL/HIGH vulnerabilities detected in Docker image (Critical=${counts.Critical}, High=${counts.High})"
+                        error "CRITICAL/HIGH vulnerabilities detected in Docker image"
                     }
                 }
             }
@@ -233,17 +233,15 @@ pipeline {
 
         stage('Deploy Container') {
             steps {
-                script {
-                    sh "docker network create vprofile-net || true"
-                    sh "docker rm -f vprofile || true"
-                    sh "docker run -d --name vprofile --network vprofile-net -p 8080:8080 ${env.IMAGE_TAG} || true"
-                }
+                sh "docker network create vprofile-net || true"
+                sh "docker rm -f vprofile || true"
+                sh "docker run -d --name vprofile --network vprofile-net -p 8080:8080 ${env.IMAGE_TAG} || true"
             }
         }
 
         stage('DAST - OWASP ZAP') {
             steps {
-                script {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                     sh '''
                         docker run --rm --user root --network vprofile-net -v $(pwd):/zap/wrk:rw \
                         -t owasp/zap2docker-stable zap-baseline.py -t http://vprofile:8080 \
@@ -255,7 +253,7 @@ pipeline {
                     def criticalAlerts = zapReport.site.collectMany { it.alerts }.count { it.risk == 3 }
                     echo "OWASP ZAP Critical Alerts: ${criticalAlerts}"
                     if (criticalAlerts > 0) {
-                        error "Pipeline FAILED: OWASP ZAP found Critical issues."
+                        error "OWASP ZAP found Critical issues"
                     }
                 }
             }
@@ -266,28 +264,18 @@ pipeline {
                 script {
                     def summary = [:]
 
-                    // Collect Trivy FS
-                    if (fileExists('trivy-fs-counts.json')) {
-                        summary['trivyFS'] = readJSON file: 'trivy-fs-counts.json'
-                    }
-                    // Collect Trivy Image
-                    if (fileExists('trivy-counts.json')) {
-                        summary['trivyImage'] = readJSON file: 'trivy-counts.json'
-                    }
-                    // Collect Semgrep
+                    if (fileExists('trivy-fs-counts.json')) { summary['trivyFS'] = readJSON file: 'trivy-fs-counts.json' }
+                    if (fileExists('trivy-counts.json')) { summary['trivyImage'] = readJSON file: 'trivy-counts.json' }
+
                     if (fileExists('semgrep.json')) {
                         def semgrepData = readJSON file: 'semgrep.json'
-                        summary['semgrep'] = [
-                            total: semgrepData.results.size(),
-                            criticalHigh: semgrepData.results.count { it.severity in ['ERROR','CRITICAL','WARNING','HIGH'] }
-                        ]
+                        summary['semgrep'] = [ total: semgrepData.results.size(),
+                                               criticalHigh: semgrepData.results.count { it.severity in ['ERROR','CRITICAL','WARNING','HIGH'] } ]
                     }
-                    // Collect ZAP
+
                     if (fileExists('zap_report.json')) {
                         def zapReport = readJSON file: 'zap_report.json'
-                        summary['zap'] = [
-                            criticalAlerts: zapReport.site.collectMany { it.alerts }.count { it.risk == 3 }
-                        ]
+                        summary['zap'] = [ criticalAlerts: zapReport.site.collectMany { it.alerts }.count { it.risk == 3 } ]
                     }
 
                     writeFile file: 'devsecops-summary.json', text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(summary))
@@ -296,7 +284,6 @@ pipeline {
                 }
             }
         }
-
     }
 
     post {
