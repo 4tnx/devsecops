@@ -152,7 +152,7 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-fs.json', allowEmptyArchive: true } }
         }
 
-        stage('Build Docker Image') {
+     stage('Build Docker Image') {
     steps {
         script {
             env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
