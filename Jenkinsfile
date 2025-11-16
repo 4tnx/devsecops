@@ -196,8 +196,10 @@ pipeline {
      stage('Prepare Trivy Summary') {
     steps {
         script {
-            sh '''
+            sh '''#!/usr/bin/env bash
               set -eu
+
+              # Check if trivy JSON exists
               if [ -f trivy-image.json ]; then
                 # Top-level counts
                 jq -r '{
@@ -207,20 +209,25 @@ pipeline {
                   Low:      (.[].Vulnerabilities // [] | map(select(.Severity=="LOW")) | length)
                 }' trivy-image.json > trivy-counts.json || true
 
-                echo "Trivy summary for image ${env.IMAGE_TAG}" > trivy-summary.txt
+                echo "Trivy summary for image ${IMAGE_TAG}" > trivy-summary.txt
+
                 jq -r 'to_entries[] | .key + ": " + (.value|tostring)' trivy-counts.json >> trivy-summary.txt || true
+
                 echo "" >> trivy-summary.txt
                 echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vulnerability):" >> trivy-summary.txt
-                # top 20 unique vulns
+
                 jq -r '[.[].Vulnerabilities[]? | {severity: .Severity, pkg: .PkgName, installed: (.InstalledVersion // "-"), fixed: (.FixedVersion // "-"), vuln: .VulnerabilityID}] | sort_by(.severity) | reverse | unique_by(.vuln) | .[] | .severity + " | " + .pkg + " | " + .installed + " | " + .fixed + " | " + .vuln' trivy-image.json | head -n 20 >> trivy-summary.txt || true
               else
                 echo "No trivy-image.json present; cannot summarize" > trivy-summary.txt
               fi
+              
+              # Archive artifacts is handled by Jenkins steps
             '''
             archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
         }
     }
 }
+
 
 
 stage('Enforce Vulnerability Policy') {
