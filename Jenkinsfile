@@ -1,4 +1,4 @@
-// Jenkinsfile - DevSecOps pipeline with Trivy enforcement and artifact archiving
+// Jenkinsfile - DevSecOps pipeline with full enforcement and summary
 def COLOR_MAP = [
     'SUCCESS': 'good',
     'FAILURE': 'danger',
@@ -38,7 +38,6 @@ pipeline {
     }
 
     stages {
-
         stage('Clean Workspace') { steps { cleanWs() } }
 
         stage('Checkout') {
@@ -71,8 +70,20 @@ pipeline {
             parallel {
                 stage('Semgrep') {
                     steps {
-                        sh 'semgrep --config auto --output semgrep.json --json . || true'
-                        archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
+                        script {
+                            sh 'semgrep --config auto --output semgrep.json --json .'
+
+                            def semgrepData = readJSON file: 'semgrep.json'
+                            def criticalCount = semgrepData.results.count { it.severity == 'ERROR' || it.severity == 'CRITICAL' }
+                            def highCount = semgrepData.results.count { it.severity == 'WARNING' || it.severity == 'HIGH' }
+
+                            echo "Semgrep Summary: Critical=${criticalCount}, High=${highCount}"
+                            archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
+
+                            if (criticalCount > 0 || highCount > 0) {
+                                error "Pipeline FAILED: Semgrep found Critical/High issues."
+                            }
+                        }
                     }
                 }
                 stage('SonarQube') {
@@ -103,7 +114,7 @@ pipeline {
         }
 
         stage('Secrets Scan') {
-            steps { sh 'gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true' }
+            steps { sh 'gitleaks detect --source . --report-format json --report-path gitleaks-report.json' }
             post { always { archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true } }
         }
 
@@ -112,14 +123,33 @@ pipeline {
                 sh 'mvn org.owasp:dependency-check-maven:check -Dformat=XML || true'
                 sh 'mvn org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom || true'
             }
-            post {
-                always { archiveArtifacts artifacts: 'target/dependency-check-report.xml,target/bom.*', allowEmptyArchive: true }
-            }
+            post { always { archiveArtifacts artifacts: 'target/dependency-check-report.xml,target/bom.*', allowEmptyArchive: true } }
         }
 
         stage('Trivy File Scan') {
-            steps { sh 'trivy fs --exit-code 0 --format json -o trivy-fs.json . || true' }
-            post { always { archiveArtifacts artifacts: 'trivy-fs.json', allowEmptyArchive: true } }
+            steps {
+                script {
+                    sh 'trivy fs --format json -o trivy-fs.json .'
+
+                    def trivyFs = readJSON file: 'trivy-fs.json'
+                    def vulnerabilities = trivyFs.Vulnerabilities ?: []
+
+                    def counts = [
+                        Critical: vulnerabilities.count { it.Severity == 'CRITICAL' },
+                        High:     vulnerabilities.count { it.Severity == 'HIGH' },
+                        Medium:   vulnerabilities.count { it.Severity == 'MEDIUM' },
+                        Low:      vulnerabilities.count { it.Severity == 'LOW' }
+                    ]
+
+                    echo "Trivy FS Summary: ${counts}"
+                    writeFile file: 'trivy-fs-counts.json', text: groovy.json.JsonOutput.toJson(counts)
+                    archiveArtifacts artifacts: 'trivy-fs.json,trivy-fs-counts.json', allowEmptyArchive: true
+
+                    if (counts.Critical > 0 || counts.High > 0) {
+                        error "Pipeline FAILED: Trivy FS found Critical/High vulnerabilities."
+                    }
+                }
+            }
         }
 
         stage('Build Docker Image') {
@@ -156,70 +186,38 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
         }
 
-    stage('Prepare Trivy Summary & Enforce Policy') {
-    steps {
-        script {
-            // --- Read Trivy JSON safely ---
-            def trivyFile = 'trivy-image.json'
-            def vulnerabilities = []
+        stage('Prepare Trivy Summary & Enforce Policy') {
+            steps {
+                script {
+                    def trivyFile = 'trivy-image.json'
+                    def vulnerabilities = []
 
-            if (fileExists(trivyFile)) {
-                def trivyJson = readJSON file: trivyFile
+                    if (fileExists(trivyFile)) {
+                        def trivyJson = readJSON file: trivyFile
+                        trivyJson.each { r ->
+                            if (r instanceof Map && r.containsKey('Vulnerabilities')) {
+                                vulnerabilities.addAll(r.Vulnerabilities ?: [])
+                            }
+                        }
+                    } else { echo "Trivy JSON file not found: ${trivyFile}" }
 
-                // Loop through top-level elements safely
-                trivyJson.each { r ->
-                    if (r instanceof Map && r.containsKey('Vulnerabilities')) {
-                        vulnerabilities.addAll(r.Vulnerabilities ?: [])
+                    def counts = [
+                        Critical: vulnerabilities.count { it.Severity == 'CRITICAL' },
+                        High:     vulnerabilities.count { it.Severity == 'HIGH' },
+                        Medium:   vulnerabilities.count { it.Severity == 'MEDIUM' },
+                        Low:      vulnerabilities.count { it.Severity == 'LOW' }
+                    ]
+
+                    echo "Trivy Image Summary: ${counts}"
+                    writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
+                    archiveArtifacts artifacts: 'trivy-counts.json', allowEmptyArchive: true
+
+                    if (counts.Critical > 0 || counts.High > 0) {
+                        error "Pipeline FAILED: CRITICAL/HIGH vulnerabilities detected in Docker image (Critical=${counts.Critical}, High=${counts.High})"
                     }
                 }
-            } else {
-                echo "Trivy JSON file not found: ${trivyFile}"
-            }
-
-            // --- Count vulnerabilities by severity ---
-            def counts = [
-                Critical: vulnerabilities.count { it.Severity == 'CRITICAL' },
-                High:     vulnerabilities.count { it.Severity == 'HIGH' },
-                Medium:   vulnerabilities.count { it.Severity == 'MEDIUM' },
-                Low:      vulnerabilities.count { it.Severity == 'LOW' }
-            ]
-
-            // --- Print summary ---
-            echo "Trivy Summary:"
-            counts.each { k, v ->
-                echo "${k}: ${v}"
-            }
-
-            // --- Save summary to file (optional) ---
-            writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
-            archiveArtifacts artifacts: 'trivy-counts.json', allowEmptyArchive: true
-
-            // --- Print top 20 vulnerabilities ---
-            if (vulnerabilities.size() > 0) {
-                echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vuln):"
-                vulnerabilities.sort { a, b ->
-                    // Sort by severity: CRITICAL > HIGH > MEDIUM > LOW
-                    def severityOrder = ['CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1]
-                    return (severityOrder[b.Severity] ?: 0) <=> (severityOrder[a.Severity] ?: 0)
-                }.take(20).each { vuln ->
-                    echo "${vuln.Severity} | ${vuln.PkgName} | ${vuln.InstalledVersion ?: '-'} | ${vuln.FixedVersion ?: '-'} | ${vuln.VulnerabilityID}"
-                }
-            } else {
-                echo "No vulnerabilities found in Trivy scan."
-            }
-
-            // --- Enforce Vulnerability Policy ---
-            if (counts.Critical > 0 || counts.High > 0) {
-                error "Pipeline FAILED: CRITICAL/HIGH vulnerabilities detected (Critical=${counts.Critical}, High=${counts.High})"
-            } else {
-                echo "Vulnerability policy passed."
             }
         }
-    }
-}
-
-
-        
 
         stage('Push Image to Registry') {
             when { expression { params.PUSH_IMAGE } }
@@ -249,12 +247,56 @@ pipeline {
                     sh '''
                         docker run --rm --user root --network vprofile-net -v $(pwd):/zap/wrk:rw \
                         -t owasp/zap2docker-stable zap-baseline.py -t http://vprofile:8080 \
-                        -r zap_report.html -J zap_report.json || true
+                        -r zap_report.html -J zap_report.json
                     '''
+                    archiveArtifacts artifacts: 'zap_report.html,zap_report.json', allowEmptyArchive: true
+
+                    def zapReport = readJSON file: 'zap_report.json'
+                    def criticalAlerts = zapReport.site.collectMany { it.alerts }.count { it.risk == 3 }
+                    echo "OWASP ZAP Critical Alerts: ${criticalAlerts}"
+                    if (criticalAlerts > 0) {
+                        error "Pipeline FAILED: OWASP ZAP found Critical issues."
+                    }
                 }
             }
-            post { always { archiveArtifacts artifacts: 'zap_report.html,zap_report.json', allowEmptyArchive: true } }
         }
+
+        stage('DevSecOps Combined Summary') {
+            steps {
+                script {
+                    def summary = [:]
+
+                    // Collect Trivy FS
+                    if (fileExists('trivy-fs-counts.json')) {
+                        summary['trivyFS'] = readJSON file: 'trivy-fs-counts.json'
+                    }
+                    // Collect Trivy Image
+                    if (fileExists('trivy-counts.json')) {
+                        summary['trivyImage'] = readJSON file: 'trivy-counts.json'
+                    }
+                    // Collect Semgrep
+                    if (fileExists('semgrep.json')) {
+                        def semgrepData = readJSON file: 'semgrep.json'
+                        summary['semgrep'] = [
+                            total: semgrepData.results.size(),
+                            criticalHigh: semgrepData.results.count { it.severity in ['ERROR','CRITICAL','WARNING','HIGH'] }
+                        ]
+                    }
+                    // Collect ZAP
+                    if (fileExists('zap_report.json')) {
+                        def zapReport = readJSON file: 'zap_report.json'
+                        summary['zap'] = [
+                            criticalAlerts: zapReport.site.collectMany { it.alerts }.count { it.risk == 3 }
+                        ]
+                    }
+
+                    writeFile file: 'devsecops-summary.json', text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(summary))
+                    archiveArtifacts artifacts: 'devsecops-summary.json', allowEmptyArchive: true
+                    echo "DevSecOps summary generated and archived."
+                }
+            }
+        }
+
     }
 
     post {
@@ -274,11 +316,11 @@ pipeline {
                 try {
                     emailext(
                         subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                        body: "<p>Build status: ${buildStatus}</p><p>Started by: ${buildUser}</p><p>Check artifacts (trivy-summary.txt, trivy-image.json)</p>",
+                        body: "<p>Build status: ${buildStatus}</p><p>Started by: ${buildUser}</p><p>Check artifacts (devsecops-summary.json, trivy-image.json, trivy-fs.json, zap_report.json, semgrep.json)</p>",
                         to: 'mekni.amin75@gmail.com',
                         from: 'mmekni66@gmail.com',
                         mimeType: 'text/html',
-                        attachmentsPattern: 'trivy-summary.txt,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json'
+                        attachmentsPattern: 'devsecops-summary.json,trivy-image.json,trivy-fs.json,trivy-image.txt,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json,dependency-check-report.xml'
                     )
                 } catch (e) { echo "Email failed: ${e}" }
             }
