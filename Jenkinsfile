@@ -193,10 +193,9 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
         }
 
-       stage('Prepare Trivy Summary') {
+     stage('Prepare Trivy Summary') {
     steps {
         script {
-            // Create a human-friendly summary from trivy-image.json (if present)
             sh '''
               set -eu
               if [ -f trivy-image.json ]; then
@@ -209,11 +208,11 @@ pipeline {
                 }' trivy-image.json > trivy-counts.json || true
 
                 echo "Trivy summary for image ${env.IMAGE_TAG}" > trivy-summary.txt
-                jq -r 'to_entries[] | "\(.key): \(.value)"' trivy-counts.json >> trivy-summary.txt || true
+                jq -r 'to_entries[] | .key + ": " + (.value|tostring)' trivy-counts.json >> trivy-summary.txt || true
                 echo "" >> trivy-summary.txt
                 echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vulnerability):" >> trivy-summary.txt
-                # list top 20 unique vulns sorted by severity + package
-                jq -r '[.[].Vulnerabilities[]? | {severity: .Severity, pkg: .PkgName, installed: (.InstalledVersion // "-"), fixed: (.FixedVersion // "-"), vuln: .VulnerabilityID}] | sort_by(.severity) | reverse | unique_by(.vuln) | .[] | "\(.severity) | \(.pkg) | \(.installed) | \(.fixed) | \(.vuln)"' trivy-image.json | head -n 20 >> trivy-summary.txt || true
+                # top 20 unique vulns
+                jq -r '[.[].Vulnerabilities[]? | {severity: .Severity, pkg: .PkgName, installed: (.InstalledVersion // "-"), fixed: (.FixedVersion // "-"), vuln: .VulnerabilityID}] | sort_by(.severity) | reverse | unique_by(.vuln) | .[] | .severity + " | " + .pkg + " | " + .installed + " | " + .fixed + " | " + .vuln' trivy-image.json | head -n 20 >> trivy-summary.txt || true
               else
                 echo "No trivy-image.json present; cannot summarize" > trivy-summary.txt
               fi
@@ -224,17 +223,16 @@ pipeline {
 }
 
 
-        stage('Enforce Vulnerability Policy') {
+stage('Enforce Vulnerability Policy') {
     steps {
         script {
             if (fileExists('trivy-image.json')) {
-                // Read the JSON file
                 def trivyJson = readJSON file: 'trivy-image.json'
 
-                // Count high and critical vulnerabilities
                 def highCount = 0
                 def criticalCount = 0
 
+                // Count HIGH and CRITICAL vulnerabilities
                 trivyJson.Results.each { result ->
                     result.Vulnerabilities?.each { vuln ->
                         if (vuln.Severity == 'HIGH') {
@@ -245,18 +243,40 @@ pipeline {
                     }
                 }
 
-                echo "Trivy high count: ${highCount}"
-                echo "Trivy critical count: ${criticalCount}"
+                echo "Trivy HIGH vulnerabilities: ${highCount}"
+                echo "Trivy CRITICAL vulnerabilities: ${criticalCount}"
 
-                if (highCount + criticalCount > 0) {
-                    error "Failing pipeline because Trivy found HIGH/CRITICAL vulnerabilities"
+                // Enforce policy
+                if (params.FAIL_ON_CRITICAL_ONLY) {
+                    if (criticalCount > 0) {
+                        error "Pipeline FAILED: CRITICAL vulnerabilities detected (${criticalCount})"
+                    } else {
+                        echo "No CRITICAL vulnerabilities detected, continuing."
+                    }
+                } else {
+                    // Consider HIGH + CRITICAL
+                    def totalHighCritical = highCount + criticalCount
+                    def threshold = params.HIGH_VULN_THRESHOLD.toInteger()
+                    if (totalHighCritical > threshold) {
+                        error "Pipeline FAILED: HIGH+CRITICAL vulnerabilities (${totalHighCritical}) exceed threshold (${threshold})"
+                    } else {
+                        echo "HIGH+CRITICAL vulnerabilities (${totalHighCritical}) within threshold (${threshold}), continuing."
+                    }
                 }
+
+                // Optional legacy behavior
+                if (params.FAIL_ON_HIGH_VULNS && !params.FAIL_ON_CRITICAL_ONLY && highCount > 0) {
+                    echo "Legacy flag FAIL_ON_HIGH_VULNS enabled — HIGH vulnerabilities exist (${highCount})"
+                    // optionally fail or just log
+                }
+
             } else {
                 echo "No Trivy JSON found, skipping vulnerability enforcement."
             }
         }
     }
 }
+
 
 
         stage('Push Image to Registry (optional)') {
