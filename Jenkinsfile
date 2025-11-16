@@ -1,5 +1,5 @@
-// Jenkinsfile - DevSecOps pipeline with Trivy enforcement and artifact archiving (final)
-// Notes: robust Trivy parsing, registry normalization, sandbox-safe string handling,
+// Jenkinsfile - DevSecOps pipeline with Trivy enforcement and artifact archiving (final, sandbox-safe)
+// Notes: robust Trivy parsing, registry normalization, sandbox-safe logic (no sort/take/count closures),
 // fixed DAST target, and safer shell escaping in multiline sh blocks.
 
 def COLOR_MAP = [
@@ -81,9 +81,7 @@ pipeline {
                 stage('SonarQube') {
                     steps {
                         script {
-                            // Ensure a Jenkins credential 'sonar-token' exists with Sonar login token
                             withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
-                                // Name must match your Jenkins SonarQube configuration
                                 withSonarQubeEnv('sonar-server') {
                                     if (fileExists("${SCANNER_HOME}/bin/sonar-scanner")) {
                                         sh """
@@ -212,11 +210,24 @@ pipeline {
                         echo "Trivy JSON file not found: ${trivyFile}"
                     }
 
+                    // Tally severities using a sandbox-safe loop (avoid .count{ } closures)
+                    int critical = 0
+                    int high = 0
+                    int medium = 0
+                    int low = 0
+                    for (v in vulnerabilities) {
+                        def sev = (v['Severity'] ?: v['severity'])?.toString().toUpperCase() ?: 'UNKNOWN'
+                        if (sev == 'CRITICAL') { critical++ }
+                        else if (sev == 'HIGH') { high++ }
+                        else if (sev == 'MEDIUM') { medium++ }
+                        else if (sev == 'LOW') { low++ }
+                    }
+
                     def counts = [
-                        Critical: vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'CRITICAL' },
-                        High:     vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'HIGH' },
-                        Medium:   vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'MEDIUM' },
-                        Low:      vulnerabilities.count { (it['Severity'] ?: it['severity'])?.toString().toUpperCase() == 'LOW' }
+                        Critical: critical,
+                        High:     high,
+                        Medium:   medium,
+                        Low:      low
                     ]
 
                     echo "Trivy Vulnerability Summary:"
@@ -225,33 +236,52 @@ pipeline {
                     // Save JSON summary
                     writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(counts)
 
-                    // Build a human-readable summary using a List to avoid sandbox-rejected methods
+                    // Build human-readable summary using simple lists and loops (sandbox-safe)
                     def lines = []
                     lines << "Trivy Vulnerability Summary for ${env.IMAGE_TAG}"
-                    counts.each { k, v -> lines << "${k}: ${v}" }
+                    lines << "Critical: ${counts.Critical}"
+                    lines << "High: ${counts.High}"
+                    lines << "Medium: ${counts.Medium}"
+                    lines << "Low: ${counts.Low}"
 
                     if (vulnerabilities.size() > 0) {
                         lines << ''
                         lines << 'Top vulnerabilities:'
 
-                        // Sort vulnerabilities by severity (sandbox-safe), then select top N using index.
-                        def ordered = vulnerabilities.sort { a, b ->
-                            def order = ['CRITICAL':4,'HIGH':3,'MEDIUM':2,'LOW':1]
-                            return (order[(b['Severity']?:b['severity'])?.toString().toUpperCase()]?:0) <=> (order[(a['Severity']?:a['severity'])?.toString().toUpperCase()]?:0)
+                        // Bucket vulnerabilities by normalized severity
+                        def buckets = [ 'CRITICAL': [], 'HIGH': [], 'MEDIUM': [], 'LOW': [] ]
+                        for (v in vulnerabilities) {
+                            def sev = (v['Severity'] ?: v['severity'])?.toString().toUpperCase() ?: 'UNKNOWN'
+                            if (buckets.containsKey(sev)) {
+                                buckets[sev] << v
+                            } else {
+                                // ignore other severities or place in LOW by default
+                                buckets['LOW'] << v
+                            }
                         }
 
+                        // Drain from buckets in severity order until we have top 20
+                        def severityOrder = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
                         def topN = []
-                        def limit = Math.min(20, ordered?.size() ?: 0)
-                        for (int i = 0; i < limit; i++) {
-                            topN << ordered[i]
+                        int remaining = 20
+                        for (s in severityOrder) {
+                            def b = buckets[s]
+                            if (b == null) { continue }
+                            int take = b.size() < remaining ? b.size() : remaining
+                            for (int i = 0; i < take; i++) {
+                                topN << b[i]
+                                remaining = remaining - 1
+                                if (remaining <= 0) { break }
+                            }
+                            if (remaining <= 0) { break }
                         }
 
-                        topN.each { vuln ->
-                            def sev = (vuln['Severity']?:vuln['severity'])?:'-'
-                            def pkg = (vuln['PkgName']?:vuln['packageName'])?:'-'
-                            def inst = (vuln['InstalledVersion']?:vuln['installedVersion'])?:'-'
-                            def fix = (vuln['FixedVersion']?:vuln['fixedVersion'])?:'-'
-                            def id  = (vuln['VulnerabilityID']?:vuln['id'])?:'-'
+                        for (vuln in topN) {
+                            def sev = (vuln['Severity'] ?: vuln['severity']) ?: '-'
+                            def pkg = (vuln['PkgName'] ?: vuln['packageName']) ?: '-'
+                            def inst = (vuln['InstalledVersion'] ?: vuln['installedVersion']) ?: '-'
+                            def fix = (vuln['FixedVersion'] ?: vuln['fixedVersion']) ?: '-'
+                            def id  = (vuln['VulnerabilityID'] ?: vuln['id']) ?: '-'
                             lines << "${sev} | ${pkg} | ${inst} | ${fix} | ${id}"
                         }
                     } else {
@@ -276,7 +306,6 @@ pipeline {
             when { expression { params.PUSH_IMAGE } }
             steps {
                 script {
-                    // Normalize registry URL (strip protocol if user provided it) and choose http/https as needed
                     def raw = params.REGISTRY_URL?.trim() ?: ''
                     def protocol = raw.startsWith('https') ? 'https' : 'http'
                     def hostport = raw.replaceAll('^https?://', '')
@@ -295,7 +324,6 @@ pipeline {
                 script {
                     sh "docker network create vprofile-net || true"
                     sh "docker rm -f vprofile || true"
-                    // container exposes 8081 in this pipeline; bind to 8081:8081
                     sh "docker run -d --name vprofile --network vprofile-net -p 8081:8081 ${env.IMAGE_TAG} || true"
                 }
             }
@@ -305,7 +333,6 @@ pipeline {
             steps {
                 script {
                     echo '🔍 Running OWASP ZAP baseline scan...'
-                    // Use the port the app is actually bound to (8081)
                     def zapTarget = 'http://localhost:8081'
 
                     sh """
