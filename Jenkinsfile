@@ -224,67 +224,39 @@ pipeline {
         }
 
         stage('Enforce Vulnerability Policy') {
-            steps {
-                script {
-                    // Default behavior: fail on CRITICALs if FAIL_ON_CRITICAL_ONLY==true
-                    def failBecause = ''
-                    def criticalCount = 0
-                    def highCount = 0
-                    def totalHighCritical = 0
+    steps {
+        script {
+            if (fileExists('trivy-image.json')) {
+                // Read the JSON file
+                def trivyJson = readJSON file: 'trivy-image.json'
 
-                    if (fileExists('trivy-image.json')) {
-                        def trivy = readJSON file: 'trivy-image.json'
-                        // aggregate counts
-                        trivy.Results?.each { res ->
-                            res.Vulnerabilities?.each { v ->
-                                if (v.Severity == 'CRITICAL') { criticalCount++ }
-                                if (v.Severity == 'HIGH') { highCount++ }
-                            }
+                // Count high and critical vulnerabilities
+                def highCount = 0
+                def criticalCount = 0
+
+                trivyJson.Results.each { result ->
+                    result.Vulnerabilities?.each { vuln ->
+                        if (vuln.Severity == 'HIGH') {
+                            highCount += 1
+                        } else if (vuln.Severity == 'CRITICAL') {
+                            criticalCount += 1
                         }
-                    } else {
-                        echo "No trivy-image.json found — skipping strict enforcement (but check trivy artifacts)."
-                    }
-
-                    totalHighCritical = criticalCount + highCount
-                    echo "Trivy high/critical counts: CRITICAL=${criticalCount} HIGH=${highCount} (total=${totalHighCritical})"
-
-                    // Decide failure
-                    if (params.FAIL_ON_CRITICAL_ONLY.toString() == 'true') {
-                        if (criticalCount > 0) {
-                            failBecause = "Found ${criticalCount} CRITICAL vulnerabilities (failing because FAIL_ON_CRITICAL_ONLY=true)."
-                        } else {
-                            echo "No CRITICAL vulnerabilities — PASS under FAIL_ON_CRITICAL_ONLY policy."
-                        }
-                    } else {
-                        // parse threshold as int
-                        def threshold = 0
-                        try { threshold = params.HIGH_VULN_THRESHOLD.toInteger() } catch (e) { threshold = 10 }
-                        if (totalHighCritical > threshold) {
-                            failBecause = "Found ${totalHighCritical} HIGH+CRITICAL vulnerabilities which is greater than threshold ${threshold}."
-                        } else {
-                            echo "HIGH+CRITICAL count ${totalHighCritical} <= threshold ${threshold} — PASS."
-                        }
-                    }
-
-                    // Legacy override: if FAIL_ON_HIGH_VULNS true, fail on any high/critical (backwards compat)
-                    if (!failBecause && params.FAIL_ON_HIGH_VULNS.toString() == 'true') {
-                        if (highCount > 0 || criticalCount > 0) {
-                            failBecause = "Legacy FAIL_ON_HIGH_VULNS=true and found HIGH/CRITICAL (HIGH=${highCount}, CRITICAL=${criticalCount})."
-                        }
-                    }
-
-                    if (failBecause) {
-                        echo "==== TRIVY POLICY FAILURE ===="
-                        echo failBecause
-                        echo "See artifacts: trivy-image.json, trivy-image.txt, trivy-summary.txt for details."
-                        // fail the build with a clear message
-                        error("Failing pipeline: ${failBecause}")
-                    } else {
-                        echo "Vulnerability policy PASSED. (CRITICAL=${criticalCount}, HIGH=${highCount})"
                     }
                 }
+
+                echo "Trivy high count: ${highCount}"
+                echo "Trivy critical count: ${criticalCount}"
+
+                if (highCount + criticalCount > 0) {
+                    error "Failing pipeline because Trivy found HIGH/CRITICAL vulnerabilities"
+                }
+            } else {
+                echo "No Trivy JSON found, skipping vulnerability enforcement."
             }
         }
+    }
+}
+
 
         stage('Push Image to Registry (optional)') {
             when { expression { params.PUSH_IMAGE == true } }
