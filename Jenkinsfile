@@ -1,4 +1,4 @@
-// Jenkinsfile - Defensive, POSIX-safe, ready-to-paste Declarative pipeline
+// Jenkinsfile - full pipeline with configurable Trivy enforcement and triage artifacts
 def COLOR_MAP = [
     'SUCCESS': 'good',
     'FAILURE': 'danger',
@@ -10,7 +10,7 @@ pipeline {
     agent any
 
     tools {
-        maven 'MAVEN3'   // adjust to your Jenkins tool name
+        maven 'MAVEN3'   // adjust to your Jenkins tool names
         jdk   'JDK17'
     }
 
@@ -19,12 +19,15 @@ pipeline {
         string(name: 'REGISTRY_URL', defaultValue: '192.168.50.4:5000', description: 'Docker Registry (host:port)')
         string(name: 'IMAGE_NAME', defaultValue: 'vprofileappimg', description: 'Local image name')
         booleanParam(name: 'ENFORCE_QUALITY_GATE', defaultValue: true, description: 'Abort pipeline if Sonar Quality Gate != OK')
-        booleanParam(name: 'FAIL_ON_HIGH_VULNS', defaultValue: true, description: 'Fail pipeline if Trivy finds HIGH/CRITICAL vulnerabilities')
+        // New policy parameters:
+        booleanParam(name: 'FAIL_ON_CRITICAL_ONLY', defaultValue: true, description: 'If true, only CRITICAL vulnerabilities will fail the pipeline; HIGHs will not.')
+        string(name: 'HIGH_VULN_THRESHOLD', defaultValue: '10', description: 'If FAIL_ON_CRITICAL_ONLY=false, fail when HIGH+CRITICAL > this threshold (integer).')
+        booleanParam(name: 'FAIL_ON_HIGH_VULNS', defaultValue: true, description: 'Legacy flag — kept for backward compat (if true, original behavior could be enforced).')
     }
 
     environment {
-        SONAR_HOST_URL = 'http://192.168.50.4:9000'   // <-- change to your Sonar host URL if needed
-        SCANNER_HOME = tool 'sonar-scanner'           // sonar-scanner tool in Jenkins
+        SONAR_HOST_URL = 'http://192.168.50.4:9000'
+        SCANNER_HOME = tool 'sonar-scanner'
         NEXUS_URL = '192.168.50.4:8081'
         NEXUS_REPOSITORY = 'vprofile-repo'
         NEXUS_CREDENTIAL_ID = 'nexuslogin'
@@ -42,9 +45,7 @@ pipeline {
     }
 
     stages {
-        stage('Clean Workspace') {
-            steps { cleanWs() }
-        }
+        stage('Clean Workspace') { steps { cleanWs() } }
 
         stage('Checkout') {
             steps {
@@ -56,19 +57,13 @@ pipeline {
         }
 
         stage('Build (compile + unit tests)') {
-            steps {
-                sh 'mvn -B clean package -DskipITs=true'
-            }
-            post {
-                success { archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true }
-            }
+            steps { sh 'mvn -B clean package -DskipITs=true' }
+            post { success { archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true } }
         }
 
         stage('Publish Unit Test Results & Coverage') {
             steps {
-                script {
-                    sh 'echo "Listing top-level target directories:" && find . -maxdepth 3 -name target -exec ls -la {} \\; || true'
-                }
+                script { sh 'echo "Listing top-level target directories:" && find . -maxdepth 3 -name target -exec ls -la {} \\; || true' }
             }
             post {
                 always {
@@ -100,33 +95,11 @@ pipeline {
                 stage('SonarQube Analysis') {
                     steps {
                         script {
-                            echo "Checking SonarQube availability at ${env.SONAR_HOST_URL}"
+                            echo "Checking SonarQube at ${env.SONAR_HOST_URL}"
                             def health = sh(script: "curl -sS --max-time 8 ${env.SONAR_HOST_URL}/api/system/health || true", returnStdout: true).trim()
-                            if (!health) {
-                                echo "WARNING: SonarQube did not respond at ${env.SONAR_HOST_URL}. Sonar scanner may fail. (Continuing pipeline)."
-                            } else {
-                                echo "Sonar health: ${health}"
-                            }
-
-                            def scannerCmd = "${SCANNER_HOME}/bin/sonar-scanner " +
-                                "-Dsonar.host.url=${env.SONAR_HOST_URL} " +
-                                "-Dsonar.projectKey=vprofile " +
-                                "-Dsonar.projectName=vprofile-repo " +
-                                "-Dsonar.projectVersion=1.0 " +
-                                "-Dsonar.sources=src/ " +
-                                "-Dsonar.java.binaries=target/classes " +
-                                "-Dsonar.junit.reportsPath=target/surefire-reports " +
-                                "-Dsonar.jacoco.reportPaths=target/jacoco.exec " +
-                                "-Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml"
-
-                            echo "Running Sonar scanner (explicit host)..."
-                            try {
-                                sh scannerCmd
-                            } catch (err) {
-                                echo "Sonar scanner CLI failed: ${err}"
-                                echo "Attempting fallback: mvn sonar:sonar -Dsonar.host.url=${env.SONAR_HOST_URL} || true"
-                                sh "mvn -B sonar:sonar -Dsonar.host.url=${env.SONAR_HOST_URL} || true"
-                            }
+                            if (!health) { echo "Sonar not reachable (continuing)"; } else { echo "Sonar health: ${health}" }
+                            def scannerCmd = "${SCANNER_HOME}/bin/sonar-scanner -Dsonar.host.url=${env.SONAR_HOST_URL} -Dsonar.projectKey=vprofile -Dsonar.projectName=vprofile-repo -Dsonar.projectVersion=1.0 -Dsonar.sources=src/ -Dsonar.java.binaries=target/classes -Dsonar.junit.reportsPath=target/surefire-reports -Dsonar.jacoco.reportPaths=target/jacoco.exec -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml"
+                            try { sh scannerCmd } catch (err) { echo "Sonar scanner CLI failed: ${err}"; sh "mvn -B sonar:sonar -Dsonar.host.url=${env.SONAR_HOST_URL} || true" }
                         }
                     }
                 }
@@ -139,13 +112,9 @@ pipeline {
                     timeout(time: 3, unit: 'MINUTES') {
                         try {
                             def qg = waitForQualityGate()
-                            echo "SonarQube Quality Gate status: ${qg.status}"
-                            if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') {
-                                error "Quality Gate failed with status: ${qg.status}"
-                            }
-                        } catch (e) {
-                            echo "waitForQualityGate failed or timed out: ${e} (continuing pipeline)"
-                        }
+                            echo "Quality Gate status: ${qg.status}"
+                            if (params.ENFORCE_QUALITY_GATE && qg.status != 'OK') { error "Quality Gate failed: ${qg.status}" }
+                        } catch (e) { echo "waitForQualityGate failed/timed out: ${e} (continuing)" }
                     }
                 }
             }
@@ -184,33 +153,21 @@ pipeline {
                     timeout(time: 45, unit: 'MINUTES') {
                         retry(2) {
                             sh """
-                                # POSIX-safe shell; avoid 'pipefail' which /bin/sh (dash) may not support
                                 set -eu
-
-                                # Enable BuildKit (BuildKit speed is beneficial; keep even if docker ignores it)
                                 export DOCKER_BUILDKIT=1
-
-                                # Parse base image from Dockerfile (first FROM)
                                 if [ -f Dockerfile ]; then
                                   BASE_IMAGE=\$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
                                 else
                                   BASE_IMAGE=""
                                 fi
-
                                 if [ -n "\$BASE_IMAGE" ]; then
                                   echo "Pre-pulling base image: \$BASE_IMAGE"
                                   docker pull "\$BASE_IMAGE" || true
                                 else
-                                  echo "No Dockerfile or no FROM line found — skipping base image pre-pull"
+                                  echo "No Dockerfile or FROM; skipping pre-pull"
                                 fi
-
-                                echo "Docker info (short):"
-                                docker info --format '{{json .}}' || true
-
-                                echo "Building image ${params.IMAGE_NAME}:latest (will tag ${env.IMAGE_TAG})"
+                                echo "Building ${params.IMAGE_NAME}:latest"
                                 docker build --network host --progress=plain --pull --cache-from ${params.IMAGE_NAME}:latest -t ${params.IMAGE_NAME}:latest .
-
-                                echo "Tagging ${params.IMAGE_NAME}:latest -> ${env.IMAGE_TAG}"
                                 docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}
                             """
                         }
@@ -228,7 +185,7 @@ pipeline {
                           trivy image -f json -o trivy-image.json ${env.IMAGE_TAG} || true
                           trivy image -f table -o trivy-image.txt ${env.IMAGE_TAG} || true
                         else
-                          echo "Image ${env.IMAGE_TAG} not found locally; skipping Trivy image scan."
+                          echo "Image ${env.IMAGE_TAG} not found; skipping image scan"
                         fi
                     """
                 }
@@ -236,28 +193,94 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
         }
 
+        stage('Prepare Trivy Summary') {
+            steps {
+                script {
+                    // Create a human-friendly summary from trivy-image.json (if present)
+                    sh '''
+                      set -eu
+                      if [ -f trivy-image.json ]; then
+                        # Top-level counts
+                        jq -r '{
+                          Critical: (.[].Vulnerabilities // [] | map(select(.Severity=="CRITICAL")) | length),
+                          High:     (.[].Vulnerabilities // [] | map(select(.Severity=="HIGH")) | length),
+                          Medium:   (.[].Vulnerabilities // [] | map(select(.Severity=="MEDIUM")) | length),
+                          Low:      (.[].Vulnerabilities // [] | map(select(.Severity=="LOW")) | length)
+                        }' trivy-image.json > trivy-counts.json || true
+
+                        echo "Trivy summary for image ${env.IMAGE_TAG}" > trivy-summary.txt
+                        jq -r 'to_entries[] | "\\(.key): \\(.value)"' trivy-counts.json >> trivy-summary.txt || true
+                        echo "" >> trivy-summary.txt
+                        echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vulnerability):" >> trivy-summary.txt
+                        # list top 20 unique vulns sorted by severity + package
+                        jq -r '[.[].Vulnerabilities[]? | {severity: .Severity, pkg: .PkgName, installed: .InstalledVersion // "-", fixed: .FixedVersion // "-", vuln: .VulnerabilityID}] | sort_by(.severity) | reverse | unique_by(.vuln) | .[] | "\(.severity) | \(.pkg) | \(.installed) | \(.fixed) | \(.vuln)"' trivy-image.json | head -n 20 >> trivy-summary.txt || true
+                      else
+                        echo "No trivy-image.json present; cannot summarize" > trivy-summary.txt
+                      fi
+                    '''
+                    archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
         stage('Enforce Vulnerability Policy') {
             steps {
                 script {
-                    if (params.FAIL_ON_HIGH_VULNS) {
-                        def fail = false
-                        if (fileExists('trivy-image.json')) {
-                            def trivy = readJSON file: 'trivy-image.json'
-                            def criticalOrHigh = 0
-                            trivy.Results?.each { res ->
-                                res.Vulnerabilities?.each { v ->
-                                    if (v.Severity == 'CRITICAL' || v.Severity == 'HIGH') { criticalOrHigh++ }
-                                }
-                            }
-                            echo "Trivy high/critical count: ${criticalOrHigh}"
-                            if (criticalOrHigh > 0) { fail = true }
-                        } else {
-                            echo "No trivy-image.json found; skipping strict image vulnerability enforcement."
-                        }
+                    // Default behavior: fail on CRITICALs if FAIL_ON_CRITICAL_ONLY==true
+                    def failBecause = ''
+                    def criticalCount = 0
+                    def highCount = 0
+                    def totalHighCritical = 0
 
-                        if (fail) { error "Failing pipeline because Trivy found HIGH/CRITICAL vulnerabilities" }
+                    if (fileExists('trivy-image.json')) {
+                        def trivy = readJSON file: 'trivy-image.json'
+                        // aggregate counts
+                        trivy.Results?.each { res ->
+                            res.Vulnerabilities?.each { v ->
+                                if (v.Severity == 'CRITICAL') { criticalCount++ }
+                                if (v.Severity == 'HIGH') { highCount++ }
+                            }
+                        }
                     } else {
-                        echo "FAIL_ON_HIGH_VULNS disabled - vulnerability enforcement skipped."
+                        echo "No trivy-image.json found — skipping strict enforcement (but check trivy artifacts)."
+                    }
+
+                    totalHighCritical = criticalCount + highCount
+                    echo "Trivy high/critical counts: CRITICAL=${criticalCount} HIGH=${highCount} (total=${totalHighCritical})"
+
+                    // Decide failure
+                    if (params.FAIL_ON_CRITICAL_ONLY.toString() == 'true') {
+                        if (criticalCount > 0) {
+                            failBecause = "Found ${criticalCount} CRITICAL vulnerabilities (failing because FAIL_ON_CRITICAL_ONLY=true)."
+                        } else {
+                            echo "No CRITICAL vulnerabilities — PASS under FAIL_ON_CRITICAL_ONLY policy."
+                        }
+                    } else {
+                        // parse threshold as int
+                        def threshold = 0
+                        try { threshold = params.HIGH_VULN_THRESHOLD.toInteger() } catch (e) { threshold = 10 }
+                        if (totalHighCritical > threshold) {
+                            failBecause = "Found ${totalHighCritical} HIGH+CRITICAL vulnerabilities which is greater than threshold ${threshold}."
+                        } else {
+                            echo "HIGH+CRITICAL count ${totalHighCritical} <= threshold ${threshold} — PASS."
+                        }
+                    }
+
+                    // Legacy override: if FAIL_ON_HIGH_VULNS true, fail on any high/critical (backwards compat)
+                    if (!failBecause && params.FAIL_ON_HIGH_VULNS.toString() == 'true') {
+                        if (highCount > 0 || criticalCount > 0) {
+                            failBecause = "Legacy FAIL_ON_HIGH_VULNS=true and found HIGH/CRITICAL (HIGH=${highCount}, CRITICAL=${criticalCount})."
+                        }
+                    }
+
+                    if (failBecause) {
+                        echo "==== TRIVY POLICY FAILURE ===="
+                        echo failBecause
+                        echo "See artifacts: trivy-image.json, trivy-image.txt, trivy-summary.txt for details."
+                        // fail the build with a clear message
+                        error("Failing pipeline: ${failBecause}")
+                    } else {
+                        echo "Vulnerability policy PASSED. (CRITICAL=${criticalCount}, HIGH=${highCount})"
                     }
                 }
             }
@@ -307,46 +330,28 @@ pipeline {
                 def color = COLOR_MAP[buildStatus] ?: '#CCCCCC'
 
                 def buildUser = env.BUILD_USER_ID ?: env.BUILD_USER
-                if (!buildUser) {
-                    buildUser = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' HEAD || echo 'GitHub User'").trim()
-                }
+                if (!buildUser) { buildUser = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' HEAD || echo 'GitHub User'").trim() }
 
                 try {
-                    slackSend(
-                        channel: '#devsecops',
-                        color: color,
-                        message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
+                    slackSend(channel: '#devsecops', color: color, message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
 👤 *Started by:* ${buildUser}
-🔗 *Build URL:* <${env.BUILD_URL}|Click Here for Details>"""
-                    )
-                } catch (e) {
-                    echo "Slack notification failed: ${e}"
-                }
+🔗 *Build URL:* <${env.BUILD_URL}|Click Here for Details>""")
+                } catch (e) { echo "Slack failed: ${e}" }
 
                 try {
                     emailext (
                         subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                        body: """
-                            <p> Created by Mekni Mohamed Amin </p>
-                            <p> DevSecops CICD pipeline status.</p>
-                            <p>Project: ${env.JOB_NAME}</p>
-                            <p>Build Number: ${env.BUILD_NUMBER}</p>
-                            <p>Build Status: ${buildStatus}</p>
-                            <p>Started by: ${buildUser}</p>
-                            <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-                        """,
+                        body: "<p>Build status: ${buildStatus}</p><p>Started by: ${buildUser}</p><p>Check artifacts (trivy-summary.txt, trivy-image.json, trivy-image.txt)</p>",
                         to: 'mekni.amin75@gmail.com',
                         from: 'mmekni66@gmail.com',
                         mimeType: 'text/html',
-                        attachmentsPattern: 'trivy-fs.json,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json'
+                        attachmentsPattern: 'trivy-summary.txt,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json'
                     )
-                } catch (e) {
-                    echo "Email notification failed: ${e}"
-                }
+                } catch (e) { echo "Email failed: ${e}" }
             }
         }
 
-        failure { script { echo "Build FAILED - consider adding cleanup or ticketing here." } }
+        failure { script { echo "Build FAILED - investigate trivy-summary.txt and trivy-image.json (archived)." } }
         success { script { echo "Build SUCCESS" } }
     }
 }
