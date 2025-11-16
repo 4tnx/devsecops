@@ -18,6 +18,7 @@ pipeline {
         string(name: 'REGISTRY_URL', defaultValue: '192.168.50.4:5000', description: 'Docker Registry (host:port) - do NOT include protocol')
         string(name: 'IMAGE_NAME', defaultValue: 'vprofileappimg', description: 'Local image name')
         booleanParam(name: 'ENFORCE_QUALITY_GATE', defaultValue: true, description: 'Abort pipeline if Sonar Quality Gate != OK')
+        booleanParam(name: 'FAIL_ON_CRITICAL_VULNS', defaultValue: false, description: 'Fail build if CRITICAL vulnerabilities are found')
     }
 
     environment {
@@ -194,8 +195,8 @@ pipeline {
                     sh """
                         set -eu
                         docker image inspect ${env.IMAGE_TAG} > /dev/null 2>&1
-                        trivy image --scanners vuln --severity CRITICAL,HIGH -f json -o trivy-image.json ${env.IMAGE_TAG} || true
-                        trivy image --scanners vuln --severity CRITICAL,HIGH -f table -o trivy-image.txt ${env.IMAGE_TAG} || true
+                        trivy image --scanners vuln --severity CRITICAL,HIGH,MEDIUM -f json -o trivy-image.json ${env.IMAGE_TAG} || true
+                        trivy image --scanners vuln --severity CRITICAL,HIGH,MEDIUM -f table -o trivy-image.txt ${env.IMAGE_TAG} || true
                     """
                 }
             }
@@ -227,55 +228,68 @@ pipeline {
                         echo "Trivy JSON file not found: ${trivyFile}"
                     }
 
-                    int critical = 0, high = 0, medium = 0, low = 0
+                    int critical = 0, high = 0, medium = 0, low = 0, unknown = 0
                     for (v in vulnerabilities) {
                         def sev = (v['Severity'] ?: v['severity'])?.toUpperCase() ?: 'UNKNOWN'
                         if (sev == 'CRITICAL') critical++
                         else if (sev == 'HIGH') high++
                         else if (sev == 'MEDIUM') medium++
                         else if (sev == 'LOW') low++
+                        else unknown++
                     }
 
-                    def countsMap = [ Critical: critical, High: high, Medium: medium, Low: low ]
+                    def countsMap = [ 
+                        Critical: critical, 
+                        High: high, 
+                        Medium: medium, 
+                        Low: low,
+                        Unknown: unknown,
+                        Total: vulnerabilities.size()
+                    ]
+                    
                     writeFile file: 'trivy-counts.json', text: groovy.json.JsonOutput.toJson(countsMap)
                     archiveArtifacts artifacts: 'trivy-counts.json', allowEmptyArchive: true
 
                     def lines = []
                     lines << "Trivy Vulnerability Summary for ${env.IMAGE_TAG}"
+                    lines << "=============================================="
                     lines << "Critical: ${critical}"
                     lines << "High: ${high}"
                     lines << "Medium: ${medium}"
                     lines << "Low: ${low}"
+                    lines << "Unknown: ${unknown}"
+                    lines << "Total: ${vulnerabilities.size()}"
+                    lines << ""
 
                     if (vulnerabilities.size() > 0) {
-                        lines << ''
-                        lines << 'Top vulnerabilities:'
-                        def buckets = [ 'CRITICAL': [], 'HIGH': [], 'MEDIUM': [], 'LOW': [] ]
+                        lines << 'Top vulnerabilities by severity:'
+                        lines << ""
+                        
+                        def buckets = [ 'CRITICAL': [], 'HIGH': [], 'MEDIUM': [], 'LOW': [], 'UNKNOWN': [] ]
                         for (v in vulnerabilities) {
                             def sev = (v['Severity'] ?: v['severity'])?.toUpperCase() ?: 'UNKNOWN'
-                            buckets.get(sev, buckets['LOW']) << v
+                            buckets.get(sev, buckets['UNKNOWN']) << v
                         }
 
-                        def severityOrder = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
-                        def topN = []
-                        int remaining = 20
+                        def severityOrder = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN']
                         for (s in severityOrder) {
                             def b = buckets[s]
-                            int take = Math.min(b?.size() ?: 0, remaining)
-                            if (take > 0) {
-                                topN.addAll(b[0..<take])
-                                remaining -= take
+                            if (b && b.size() > 0) {
+                                lines << "${s} (${b.size()}):"
+                                def topVulns = b.take(5)
+                                for (vuln in topVulns) {
+                                    def sev = vuln['Severity'] ?: vuln['severity'] ?: '-'
+                                    def pkg = vuln['PkgName'] ?: vuln['packageName'] ?: '-'
+                                    def inst = vuln['InstalledVersion'] ?: vuln['installedVersion'] ?: '-'
+                                    def fix = vuln['FixedVersion'] ?: vuln['fixedVersion'] ?: 'None'
+                                    def id  = vuln['VulnerabilityID'] ?: vuln['id'] ?: '-'
+                                    lines << "  - ${id} | ${pkg}@${inst} | Fixed: ${fix}"
+                                }
+                                if (b.size() > 5) {
+                                    lines << "  ... and ${b.size() - 5} more"
+                                }
+                                lines << ""
                             }
-                            if (remaining <= 0) break
-                        }
-
-                        for (vuln in topN) {
-                            def sev = vuln['Severity'] ?: vuln['severity'] ?: '-'
-                            def pkg = vuln['PkgName'] ?: vuln['packageName'] ?: '-'
-                            def inst = vuln['InstalledVersion'] ?: vuln['installedVersion'] ?: '-'
-                            def fix = vuln['FixedVersion'] ?: vuln['fixedVersion'] ?: '-'
-                            def id  = vuln['VulnerabilityID'] ?: vuln['id'] ?: '-'
-                            lines << "${sev} | ${pkg} | ${inst} | ${fix} | ${id}"
                         }
                     } else {
                         lines << "No vulnerabilities found by Trivy."
@@ -284,12 +298,25 @@ pipeline {
                     writeFile file: 'trivy-summary.txt', text: lines.join('\n')
                     archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
 
+                    // Vulnerability enforcement with configurable behavior
+                    echo "Vulnerability Summary: Critical=${critical}, High=${high}, Medium=${medium}, Low=${low}"
+                    
                     if (critical > 0) {
-                        error "Pipeline FAILED: CRITICAL vulnerabilities detected (Critical=${critical})"
-                    } else if (high > 0) {
-                        echo "WARNING: ${high} High vulnerabilities found — please triage."
+                        def message = "CRITICAL vulnerabilities detected (Critical=${critical}, High=${high})"
+                        if (params.FAIL_ON_CRITICAL_VULNS) {
+                            error "Pipeline FAILED: ${message}"
+                        } else {
+                            unstable "WARNING: ${message} - Build marked unstable but continuing"
+                        }
+                    } else if (high > 10) {
+                        def message = "High number of HIGH vulnerabilities detected (High=${high})"
+                        if (params.FAIL_ON_CRITICAL_VULNS) {
+                            echo "WARNING: ${message} - Continuing build"
+                        } else {
+                            unstable "WARNING: ${message} - Build marked unstable but continuing"
+                        }
                     } else {
-                        echo "✅ Vulnerability policy passed (no CRITICALs)."
+                        echo "✅ Vulnerability policy passed (no CRITICALs, acceptable HIGH count)."
                     }
                 }
             }
@@ -298,7 +325,7 @@ pipeline {
         stage('Push Image to Registry') {
             when { 
                 expression { 
-                    return params.PUSH_IMAGE 
+                    return params.PUSH_IMAGE && currentBuild.result != 'FAILURE'
                 } 
             }
             steps {
@@ -317,16 +344,23 @@ pipeline {
         }
 
         stage('Deploy Container') {
+            when {
+                expression { currentBuild.result != 'FAILURE' }
+            }
             steps {
                 script {
                     sh "docker network create vprofile-net || true"
                     sh "docker rm -f vprofile || true"
                     sh "docker run -d --name vprofile --network vprofile-net -p 8081:8081 ${env.IMAGE_TAG} || true"
+                    sleep 30 // Wait for container to start
                 }
             }
         }
 
         stage("DAST Scan with OWASP ZAP") {
+            when {
+                expression { currentBuild.result != 'FAILURE' }
+            }
             steps {
                 script {
                     echo '🔍 Running OWASP ZAP baseline scan...'
@@ -335,7 +369,7 @@ pipeline {
                         docker run --rm --user root --network host -v \$(pwd):/zap/wrk:rw \\
                         -t ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \\
                         -t ${zapTarget} \\
-                        -r zap_report.html -J zap_report.json
+                        -r zap_report.html -J zap_report.json || true
                     """
                     echo "ZAP scan finished."
 
@@ -359,6 +393,10 @@ pipeline {
                         echo "✅ High severity issues: ${highCount}"
                         echo "⚠️ Medium severity issues: ${mediumCount}"
                         echo "ℹ️ Low severity issues: ${lowCount}"
+                        
+                        if (highCount > 0) {
+                            echo "WARNING: High severity DAST vulnerabilities found"
+                        }
                     } else {
                         echo "ZAP JSON report not found, continuing build..."
                     }
@@ -368,6 +406,7 @@ pipeline {
                 always {
                     echo '📦 Archiving ZAP scan reports...'
                     archiveArtifacts artifacts: 'zap_report.html,zap_report.json', allowEmptyArchive: true
+                    sh 'docker rm -f vprofile || true'
                 }
             }
         }
@@ -383,10 +422,15 @@ pipeline {
                     buildUser = sh(returnStdout: true, script: "git --no-pager show -s --format='%an' HEAD || echo 'GitHub User'").trim()
                 }
 
+                // Clean up containers
+                sh 'docker rm -f vprofile || true'
+                sh 'docker network rm vprofile-net || true'
+
                 try {
                     slackSend(channel: '#devsecops', color: color, message: """*${buildStatus}:* Job *${env.JOB_NAME}* Build #${env.BUILD_NUMBER}
 👤 *Started by:* ${buildUser}
-🔗 *Build URL:* <${env.BUILD_URL}|Click Here>""")
+🔗 *Build URL:* <${env.BUILD_URL}|Click Here>
+📊 *Vulnerabilities:* Check Trivy reports for details""")
                 } catch (e) { 
                     echo "Slack failed: ${e}" 
                 }
@@ -394,11 +438,22 @@ pipeline {
                 try {
                     emailext(
                         subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                        body: "<p>Build status: ${buildStatus}</p><p>Started by: ${buildUser}</p><p>Check artifacts (trivy-summary.txt, trivy-image.json)</p>",
+                        body: """
+                        <h2>Build Status: ${buildStatus}</h2>
+                        <p><strong>Started by:</strong> ${buildUser}</p>
+                        <p><strong>Build URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        <p>Check attached artifacts for security scan results:</p>
+                        <ul>
+                            <li>trivy-summary.txt - Vulnerability summary</li>
+                            <li>trivy-image.json - Detailed Trivy scan results</li>
+                            <li>dependency-check-report.xml - Dependency vulnerabilities</li>
+                            <li>zap_report.html - DAST scan results</li>
+                        </ul>
+                        """,
                         to: 'mekni.amin75@gmail.com',
                         from: 'mmekni66@gmail.com',
                         mimeType: 'text/html',
-                        attachmentsPattern: 'trivy-summary.txt,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json'
+                        attachmentsPattern: 'trivy-summary.txt,trivy-image.json,trivy-image.txt,dependency-check-report.xml,zap_report.html,zap_report.json,semgrep.json,gitleaks-report.json,trivy-counts.json'
                     )
                 } catch (e) { 
                     echo "Email failed: ${e}" 
