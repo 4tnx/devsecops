@@ -193,35 +193,36 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-image.json,trivy-image.txt', allowEmptyArchive: true } }
         }
 
-        stage('Prepare Trivy Summary') {
-            steps {
-                script {
-                    // Create a human-friendly summary from trivy-image.json (if present)
-                    sh '''
-                      set -eu
-                      if [ -f trivy-image.json ]; then
-                        # Top-level counts
-                        jq -r '{
-                          Critical: (.[].Vulnerabilities // [] | map(select(.Severity=="CRITICAL")) | length),
-                          High:     (.[].Vulnerabilities // [] | map(select(.Severity=="HIGH")) | length),
-                          Medium:   (.[].Vulnerabilities // [] | map(select(.Severity=="MEDIUM")) | length),
-                          Low:      (.[].Vulnerabilities // [] | map(select(.Severity=="LOW")) | length)
-                        }' trivy-image.json > trivy-counts.json || true
+       stage('Prepare Trivy Summary') {
+    steps {
+        script {
+            // Create a human-friendly summary from trivy-image.json (if present)
+            sh '''
+              set -eu
+              if [ -f trivy-image.json ]; then
+                # Top-level counts
+                jq -r '{
+                  Critical: (.[].Vulnerabilities // [] | map(select(.Severity=="CRITICAL")) | length),
+                  High:     (.[].Vulnerabilities // [] | map(select(.Severity=="HIGH")) | length),
+                  Medium:   (.[].Vulnerabilities // [] | map(select(.Severity=="MEDIUM")) | length),
+                  Low:      (.[].Vulnerabilities // [] | map(select(.Severity=="LOW")) | length)
+                }' trivy-image.json > trivy-counts.json || true
 
-                        echo "Trivy summary for image ${env.IMAGE_TAG}" > trivy-summary.txt
-                        jq -r 'to_entries[] | "\\(.key): \\(.value)"' trivy-counts.json >> trivy-summary.txt || true
-                        echo "" >> trivy-summary.txt
-                        echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vulnerability):" >> trivy-summary.txt
-                        # list top 20 unique vulns sorted by severity + package
-                        jq -r '[.[].Vulnerabilities[]? | {severity: .Severity, pkg: .PkgName, installed: .InstalledVersion // "-", fixed: .FixedVersion // "-", vuln: .VulnerabilityID}] | sort_by(.severity) | reverse | unique_by(.vuln) | .[] | "\(.severity) | \(.pkg) | \(.installed) | \(.fixed) | \(.vuln)"' trivy-image.json | head -n 20 >> trivy-summary.txt || true
-                      else
-                        echo "No trivy-image.json present; cannot summarize" > trivy-summary.txt
-                      fi
-                    '''
-                    archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
-                }
-            }
+                echo "Trivy summary for image ${env.IMAGE_TAG}" > trivy-summary.txt
+                jq -r 'to_entries[] | "\(.key): \(.value)"' trivy-counts.json >> trivy-summary.txt || true
+                echo "" >> trivy-summary.txt
+                echo "Top 20 vulnerabilities (severity | pkg | installed | fixed | vulnerability):" >> trivy-summary.txt
+                # list top 20 unique vulns sorted by severity + package
+                jq -r '[.[].Vulnerabilities[]? | {severity: .Severity, pkg: .PkgName, installed: (.InstalledVersion // "-"), fixed: (.FixedVersion // "-"), vuln: .VulnerabilityID}] | sort_by(.severity) | reverse | unique_by(.vuln) | .[] | "\(.severity) | \(.pkg) | \(.installed) | \(.fixed) | \(.vuln)"' trivy-image.json | head -n 20 >> trivy-summary.txt || true
+              else
+                echo "No trivy-image.json present; cannot summarize" > trivy-summary.txt
+              fi
+            '''
+            archiveArtifacts artifacts: 'trivy-summary.txt', allowEmptyArchive: true
         }
+    }
+}
+
 
         stage('Enforce Vulnerability Policy') {
     steps {
