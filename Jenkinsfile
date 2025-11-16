@@ -148,25 +148,26 @@ pipeline {
             post { always { archiveArtifacts artifacts: 'trivy-fs.json', allowEmptyArchive: true } }
         }
 
-        stage('Build Docker Image') {
-            steps {
-                script {
-                    env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
-                    timeout(time: 45, unit: 'MINUTES') {
-                        retry(2) {
-                            sh '''
-                                set -eu
-                                export DOCKER_BUILDKIT=1
-                                BASE_IMAGE=$(sed -n 's/^FROM[[:space:]]\+\([^[:space:]]\+\).*/\1/p' Dockerfile | head -n1 || true)
-                                [ -n "$BASE_IMAGE" ] && docker pull "$BASE_IMAGE" || true
-                                docker build --network host --progress=plain --pull --cache-from ${IMAGE_NAME}:latest -t ${IMAGE_NAME}:latest .
-                                docker tag ${IMAGE_NAME}:latest ${IMAGE_TAG}
-                            '''
-                        }
-                    }
+       stage('Build Docker Image') {
+    steps {
+        script {
+            env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
+            timeout(time: 45, unit: 'MINUTES') {
+                retry(2) {
+                    sh """
+                        set -eu
+                        export DOCKER_BUILDKIT=1
+                        BASE_IMAGE=\$(sed -n 's/^FROM[[:space:]]\\+\\([^[:space:]]\\+\\).*/\\1/p' Dockerfile | head -n1 || true)
+                        [ -n "\$BASE_IMAGE" ] && docker pull "\$BASE_IMAGE" || true
+                        docker build --network host --progress=plain --pull --cache-from ${IMAGE_NAME}:latest -t ${IMAGE_NAME}:latest .
+                        docker tag ${IMAGE_NAME}:latest ${IMAGE_TAG}
+                    """
                 }
             }
         }
+    }
+}
+
 
         stage('Trivy Image Scan') {
             steps {
