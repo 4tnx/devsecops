@@ -33,7 +33,7 @@ pipeline {
         skipDefaultCheckout(false)
         buildDiscarder(logRotator(numToKeepStr: '10'))
         durabilityHint('MAX_SURVIVABILITY')
-        timeout(time: 60, unit: 'MINUTES')
+        timeout(time: 90, unit: 'MINUTES') // Augmenté pour Trivy
     }
 
     stages {
@@ -106,9 +106,6 @@ pipeline {
                 '''
             }
             post { 
-                success { 
-                    archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: true 
-                }
                 always {
                     junit testResults: '**/target/surefire-reports/*.xml', allowEmptyResults: true
                     jacoco(
@@ -117,6 +114,15 @@ pipeline {
                         sourcePattern: '**/src/main/java',
                         exclusionPattern: '**/src/test/*'
                     )
+                    // Tentative d'archivage du WAR si généré
+                    script {
+                        def warFiles = findFiles(glob: '**/target/*.war')
+                        if (!warFiles.isEmpty()) {
+                            archiveArtifacts artifacts: '**/target/*.war', allowEmptyArchive: false
+                        } else {
+                            echo "No WAR files found to archive - this is normal for some projects"
+                        }
+                    }
                 }
             }
         }
@@ -150,7 +156,7 @@ pipeline {
         stage('Quality Gate') {
             steps {
                 script {
-                    timeout(time: 5, unit: 'MINUTES') {
+                    timeout(time: 10, unit: 'MINUTES') { // Augmenté le timeout
                         def qg = waitForQualityGate()
                         echo "Quality Gate status: ${qg.status}"
                         
@@ -202,8 +208,9 @@ pipeline {
                     steps {
                         sh '''
                             echo "🔍 Scanning dependencies with Trivy..."
-                            # Augmenter le timeout pour Trivy et utiliser un mirror plus fiable
-                            TRIVY_TIMEOUT=600 trivy fs --scanners vuln --severity CRITICAL,HIGH --format json --output trivy-sca.json --timeout 10m . || echo "Trivy scan completed with warnings"
+                            echo "This may take several minutes due to database download..."
+                            # Utilisation de cache local et timeout étendu
+                            trivy fs --scanners vuln --severity CRITICAL,HIGH --format json --output trivy-sca.json --timeout 15m . || echo "Trivy scan completed with warnings"
                         '''
                     }
                     post {
@@ -211,8 +218,9 @@ pipeline {
                             script {
                                 if (fileExists('trivy-sca.json')) {
                                     archiveArtifacts artifacts: 'trivy-sca.json', allowEmptyArchive: true
+                                    echo "✅ Trivy scan completed successfully"
                                 } else {
-                                    echo "Trivy scan file not found, skipping artifact archiving"
+                                    echo "⚠️ Trivy scan file not found, but continuing build"
                                 }
                             }
                         }
@@ -233,30 +241,34 @@ pipeline {
                         high: 0,
                         medium: 0,
                         secrets: 0,
-                        semgrep: 0
+                        semgrep: 0,
+                        trivyCritical: 0,
+                        trivyHigh: 0
                     ]
                     
-                    // Analyser le rapport Gitleaks de manière sécurisée
+                    // Analyser le rapport Gitleaks
                     if (fileExists('gitleaks-report.json')) {
                         try {
                             def gitleaksReport = readJSON file: 'gitleaks-report.json'
                             securityFindings.secrets = gitleaksReport instanceof Map ? gitleaksReport.get('Findings', []).size() : 0
+                            echo "🔑 Gitleaks findings: ${securityFindings.secrets}"
                         } catch (Exception e) {
                             echo "⚠️ Error reading gitleaks report: ${e.message}"
                         }
                     }
                     
-                    // Analyser le rapport Semgrep de manière sécurisée
+                    // Analyser le rapport Semgrep
                     if (fileExists('semgrep.json')) {
                         try {
                             def semgrepReport = readJSON file: 'semgrep.json'
                             securityFindings.semgrep = semgrepReport instanceof Map ? semgrepReport.get('results', []).size() : 0
+                            echo "🐛 Semgrep findings: ${securityFindings.semgrep}"
                         } catch (Exception e) {
                             echo "⚠️ Error reading semgrep report: ${e.message}"
                         }
                     }
                     
-                    // Analyser les dépendances avec une méthode simple
+                    // Analyser les dépendances OWASP
                     if (fileExists('target/dependency-check-report/dependency-check-report.xml')) {
                         try {
                             def xmlContent = readFile('target/dependency-check-report/dependency-check-report.xml')
@@ -266,33 +278,67 @@ pipeline {
                             securityFindings.high = countOccurrences(xmlContent, 'severity="HIGH"')
                             securityFindings.medium = countOccurrences(xmlContent, 'severity="MEDIUM"')
                             
+                            echo "📊 OWASP Dependency Check:"
+                            echo "  🔴 CRITICAL: ${securityFindings.critical}"
+                            echo "  🟠 HIGH: ${securityFindings.high}"
+                            echo "  🟡 MEDIUM: ${securityFindings.medium}"
+                            
                         } catch (Exception e) {
                             echo "⚠️ Error analyzing dependency check report: ${e.message}"
                         }
                     }
                     
-                    echo "Security Scan Results:"
-                    echo "🔴 CRITICAL vulnerabilities: ${securityFindings.critical}"
-                    echo "🟠 HIGH vulnerabilities: ${securityFindings.high}"
+                    // Analyser le rapport Trivy si disponible
+                    if (fileExists('trivy-sca.json')) {
+                        try {
+                            def trivyReport = readJSON file: 'trivy-sca.json'
+                            def results = trivyReport.get('Results', [])
+                            
+                            results.each { result ->
+                                result.get('Vulnerabilities', []).each { vuln ->
+                                    def severity = vuln.get('Severity', '').toUpperCase()
+                                    if (severity == 'CRITICAL') securityFindings.trivyCritical++
+                                    else if (severity == 'HIGH') securityFindings.trivyHigh++
+                                }
+                            }
+                            
+                            echo "🔍 Trivy SCA findings:"
+                            echo "  🔴 CRITICAL: ${securityFindings.trivyCritical}"
+                            echo "  🟠 HIGH: ${securityFindings.trivyHigh}"
+                            
+                        } catch (Exception e) {
+                            echo "⚠️ Error reading trivy report: ${e.message}"
+                        }
+                    }
+                    
+                    // Résumé final
+                    echo "=== SECURITY SCAN SUMMARY ==="
+                    echo "🔴 CRITICAL vulnerabilities: ${securityFindings.critical + securityFindings.trivyCritical}"
+                    echo "🟠 HIGH vulnerabilities: ${securityFindings.high + securityFindings.trivyHigh}"
                     echo "🟡 MEDIUM vulnerabilities: ${securityFindings.medium}"
                     echo "🔑 Secrets exposed: ${securityFindings.secrets}"
-                    echo "🐛 Semgrep findings: ${securityFindings.semgrep}"
+                    echo "🐛 Semgrep code issues: ${securityFindings.semgrep}"
                     
                     // Application des politiques de sécurité
-                    if (params.FAIL_ON_CRITICAL_VULNS && securityFindings.critical > 0) {
-                        error "❌ Build failed: ${securityFindings.critical} CRITICAL vulnerabilities detected"
-                    } else if (securityFindings.critical > 0) {
-                        unstable "⚠️ Build marked UNSTABLE: ${securityFindings.critical} CRITICAL vulnerabilities"
-                    } else if (securityFindings.high > 10) {
-                        unstable "⚠️ Build marked UNSTABLE: High number (${securityFindings.high}) of HIGH vulnerabilities"
+                    def totalCritical = securityFindings.critical + securityFindings.trivyCritical
+                    def totalHigh = securityFindings.high + securityFindings.trivyHigh
+                    
+                    if (params.FAIL_ON_CRITICAL_VULNS && totalCritical > 0) {
+                        error "❌ Build failed: ${totalCritical} CRITICAL vulnerabilities detected"
+                    } else if (totalCritical > 0) {
+                        unstable "⚠️ Build marked UNSTABLE: ${totalCritical} CRITICAL vulnerabilities detected"
+                    } else if (totalHigh > 10) {
+                        unstable "⚠️ Build marked UNSTABLE: High number (${totalHigh}) of HIGH vulnerabilities"
                     } else if (securityFindings.secrets > 0) {
                         unstable "⚠️ Build marked UNSTABLE: ${securityFindings.secrets} secrets exposed in code"
+                    } else if (securityFindings.semgrep > 20) {
+                        unstable "⚠️ Build marked UNSTABLE: High number (${securityFindings.semgrep}) of code quality issues"
                     } else {
                         echo "✅ All security policies satisfied"
                     }
                     
                     // Génération du rapport de sécurité détaillé
-                    writeFile file: 'security-compliance-report.md', text: """
+                    def securityReport = """
 # DevSecOps Security Compliance Report
 
 ## Build Information
@@ -303,15 +349,21 @@ pipeline {
 ## Security Scan Summary
 
 ### Vulnerability Analysis
-- 🔴 **CRITICAL**: ${securityFindings.critical}
-- 🟠 **HIGH**: ${securityFindings.high} 
+- 🔴 **CRITICAL**: ${totalCritical}
+- 🟠 **HIGH**: ${totalHigh}
 - 🟡 **MEDIUM**: ${securityFindings.medium}
 - 🔑 **Secrets Exposed**: ${securityFindings.secrets}
-- 🐛 **Code Issues**: ${securityFindings.semgrep}
+- 🐛 **Code Issues (Semgrep)**: ${securityFindings.semgrep}
+
+### Scan Details
+- **OWASP Dependency Check**: ${securityFindings.critical} CRITICAL, ${securityFindings.high} HIGH, ${securityFindings.medium} MEDIUM
+- **Trivy SCA**: ${securityFindings.trivyCritical} CRITICAL, ${securityFindings.trivyHigh} HIGH
+- **Gitleaks**: ${securityFindings.secrets} secrets found
+- **Semgrep**: ${securityFindings.semgrep} code issues
 
 ### Quality Gates Status
 - **SAST (SonarQube)**: ${currentBuild.result == 'SUCCESS' ? 'PASSED ✅' : 'FAILED ❌'}
-- **SCA (Dependencies)**: ${securityFindings.critical == 0 ? 'PASSED ✅' : 'FAILED ❌'}
+- **SCA (Dependencies)**: ${totalCritical == 0 ? 'PASSED ✅' : 'FAILED ❌'}
 - **Secrets Detection**: ${securityFindings.secrets == 0 ? 'PASSED ✅' : 'FAILED ❌'}
 
 ### Policy Enforcement
@@ -319,14 +371,16 @@ pipeline {
 - **Quality Gate**: ${params.ENFORCE_QUALITY_GATE ? 'ENFORCED ✅' : 'ADVISORY ℹ️'}
 
 ## Recommendations
-${securityFindings.critical > 0 ? '- **IMMEDIATE ACTION**: Address critical vulnerabilities' : ''}
-${securityFindings.high > 0 ? '- **HIGH PRIORITY**: Review high severity issues' : ''}
+${totalCritical > 0 ? '- **IMMEDIATE ACTION**: Address critical vulnerabilities in dependencies' : ''}
+${totalHigh > 0 ? '- **HIGH PRIORITY**: Review high severity issues' : ''}
 ${securityFindings.secrets > 0 ? '- **CRITICAL**: Rotate exposed secrets immediately' : ''}
+${securityFindings.semgrep > 0 ? '- **CODE QUALITY**: Review Semgrep findings' : ''}
 
 ---
 *Generated by Jenkins DevSecOps Pipeline*
                     """
                     
+                    writeFile file: 'security-compliance-report.md', text: securityReport
                     archiveArtifacts artifacts: 'security-compliance-report.md', allowEmptyArchive: true
                 }
             }
@@ -400,14 +454,15 @@ ${securityFindings.secrets > 0 ? '- **CRITICAL**: Rotate exposed secrets immedia
                 def buildUser = env.CHANGE_AUTHOR ?: env.BUILD_USER_ID ?: 'System'
                 
                 // Rapport de sécurité final
-                writeFile file: 'devsecops-final-report.md', text: """
+                def finalReport = """
 # 🛡️ DevSecOps Pipeline - Final Report
 
 ## Executive Summary
 **Status**: ${buildStatus}  
 **Build**: ${env.JOB_NAME} #${env.BUILD_NUMBER}  
 **Duration**: ${duration}  
-**Triggered by**: ${buildUser}
+**Triggered by**: ${buildUser}  
+**Commit**: ${env.GIT_COMMIT}
 
 ## Security Assessment
 ✅ **Shift-Left Security Implemented**  
@@ -415,23 +470,48 @@ ${securityFindings.secrets > 0 ? '- **CRITICAL**: Rotate exposed secrets immedia
 ✅ **SCA with OWASP Dependency Check**  
 ✅ **Secrets Detection with Gitleaks**  
 ✅ **SBOM Generation**  
+✅ **Trivy SCA Analysis**  
 ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST Testing Skipped**'}
 
 ## Quality Gates
-- Code Quality: ${currentBuild.result == 'SUCCESS' ? 'PASSED' : 'FAILED'}
-- Security Policy: ${params.FAIL_ON_CRITICAL_VULNS ? 'STRICT' : 'LENIENT'}
+- **Code Quality (SonarQube)**: ${currentBuild.result == 'SUCCESS' ? 'PASSED' : 'FAILED'}
+- **Security Policy**: ${params.FAIL_ON_CRITICAL_VULNS ? 'STRICT' : 'LENIENT'}
+- **Overall Status**: ${buildStatus}
 
 ## Artifacts Generated
 - Security compliance report
-- Vulnerability analysis
-- SBOM documentation
+- Vulnerability analysis (OWASP DC, Trivy)
+- SBOM documentation (CycloneDX)
 - Test coverage reports
+- SAST reports (Semgrep, SonarQube)
+- Secrets detection report
+
+## Next Steps
+1. Review security compliance report
+2. Address any security findings
+3. Monitor dependencies regularly
+4. Consider enabling DAST for production
 
 ---
-*This pipeline demonstrates DevSecOps practices with security integrated throughout the SDLC*
+*This pipeline demonstrates complete DevSecOps practices with security integrated throughout the SDLC*
                 """
                 
+                writeFile file: 'devsecops-final-report.md', text: finalReport
                 archiveArtifacts artifacts: 'devsecops-final-report.md', allowEmptyArchive: true
+                
+                // Publier le rapport HTML OWASP si disponible
+                script {
+                    if (fileExists('target/dependency-check-report/dependency-check-report.html')) {
+                        publishHTML([
+                            allowMissing: true,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: 'target/dependency-check-report',
+                            reportFiles: 'dependency-check-report.html',
+                            reportName: 'OWASP Dependency Check Report'
+                        ])
+                    }
+                }
             }
         }
         
@@ -441,8 +521,9 @@ ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST 
                     channel: '#devsecops',
                     color: COLOR_MAP['SUCCESS'],
                     message: """✅ DevSecOps Pipeline SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-🛡️ All security scans completed
-📊 Security policies enforced
+🛡️ All security scans completed successfully
+📊 No critical vulnerabilities detected
+⏱️ Duration: ${currentBuild.durationString}
 👤 By: ${env.BUILD_USER_ID ?: 'System'}
 🔗 ${env.BUILD_URL}"""
                 )
@@ -456,8 +537,16 @@ ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST 
                     <p><strong>Status:</strong> SUCCESS</p>
                     <p><strong>Commit:</strong> ${env.GIT_COMMIT}</p>
                     <p><strong>Duration:</strong> ${currentBuild.durationString}</p>
-                    <p>All security scans passed successfully. No critical vulnerabilities detected.</p>
-                    <p>View details: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    <p><strong>Security Summary:</strong></p>
+                    <ul>
+                        <li>✅ SAST Analysis: SonarQube & Semgrep</li>
+                        <li>✅ SCA: OWASP Dependency Check & Trivy</li>
+                        <li>✅ Secrets Detection: Gitleaks</li>
+                        <li>✅ SBOM Generation: CycloneDX</li>
+                        <li>✅ No Critical Vulnerabilities</li>
+                    </ul>
+                    <p>All security scans passed successfully with no critical issues detected.</p>
+                    <p>View detailed reports: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
                     """,
                     to: 'mekni.amin75@gmail.com',
                     from: 'mmekni66@gmail.com',
@@ -474,6 +563,7 @@ ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST 
                     message: """⚠️ DevSecOps Pipeline UNSTABLE: ${env.JOB_NAME} #${env.BUILD_NUMBER}
 ⚡ Security findings detected (non-blocking)
 📋 Review security reports for details
+⏱️ Duration: ${currentBuild.durationString}
 🔗 ${env.BUILD_URL}"""
                 )
                 
@@ -485,8 +575,9 @@ ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST 
                     <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
                     <p><strong>Status:</strong> UNSTABLE</p>
                     <p><strong>Commit:</strong> ${env.GIT_COMMIT}</p>
-                    <p>Security scans completed with non-critical findings. Review reports for details.</p>
-                    <p>View details: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    <p><strong>Duration:</strong> ${currentBuild.durationString}</p>
+                    <p>Security scans completed with non-critical findings. The build continues but requires review.</p>
+                    <p>View details and reports: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
                     """,
                     to: 'mekni.amin75@gmail.com',
                     from: 'mmekni66@gmail.com',
@@ -503,6 +594,7 @@ ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST 
                     message: """❌ DevSecOps Pipeline FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}
 🚨 Critical security issues blocked pipeline
 🔍 Immediate review required
+⏱️ Duration: ${currentBuild.durationString}
 🔗 ${env.BUILD_URL}"""
                 )
                 
@@ -514,9 +606,10 @@ ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST 
                     <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
                     <p><strong>Status:</strong> FAILED</p>
                     <p><strong>Commit:</strong> ${env.GIT_COMMIT}</p>
+                    <p><strong>Duration:</strong> ${currentBuild.durationString}</p>
                     <p><strong>Reason:</strong> Critical security vulnerabilities detected and policy enforcement enabled.</p>
-                    <p>Immediate action required to address security issues.</p>
-                    <p>View details: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    <p><strong>Action Required:</strong> Immediate security review and remediation needed.</p>
+                    <p>View detailed reports: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
                     """,
                     to: 'mekni.amin75@gmail.com',
                     from: 'mmekni66@gmail.com',
