@@ -12,7 +12,7 @@ pipeline {
         maven 'MAVEN3'
         jdk 'JDK17'
         // Ensure a Sonar scanner is configured in Jenkins global tools with this name
-        sonarScanner 'sonar-scanner'
+        sonarScanner 'sonar-token'
     }
 
     parameters {
@@ -29,7 +29,7 @@ pipeline {
 
     environment {
         SONAR_HOST_URL = 'http://192.168.50.4:9000'
-        SCANNER_HOME = tool 'sonar-scanner'
+        SCANNER_HOME = tool 'sonar-token'
         DOCKER_CREDENTIALS_ID = 'jenkins-github-https-cred'
         ARTVERSION = "${env.BUILD_NUMBER}"
         CONTAINER_NAME = "vprofile-${env.BUILD_NUMBER}"
@@ -98,7 +98,7 @@ pipeline {
                         script {
                             withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
                                 withSonarQubeEnv('sonar-server') {
-                                    def scanner = "${SCANNER_HOME}/bin/sonar-scanner"
+                                    def scanner = "${SCANNER_HOME}/bin/sonar-token"
                                     sh """
                                         set -eu
                                         if [ -x "${scanner}" ]; then
