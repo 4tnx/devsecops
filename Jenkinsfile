@@ -73,16 +73,14 @@ pipeline {
         // Étape 3: Configuration et préparation
         stage('Setup & Validate') {
             steps {
-                script {
-                    // Create proper test structure
-                    sh '''
-                        echo "🔧 Setting up test environment..."
-                        
-                        # Create proper test directory structure
-                        mkdir -p src/test/java/com/visualpathit/test
-                        
-                        # Create a proper JUnit 5 test
-                        cat > src/test/java/com/visualpathit/test/BasicTest.java << 'EOF'
+                sh '''
+                    echo "🔧 Setting up test environment..."
+                    
+                    # Create proper test directory structure
+                    mkdir -p src/test/java/com/visualpathit/test
+                    
+                    # Create a proper JUnit 5 test
+                    cat > src/test/java/com/visualpathit/test/BasicTest.java << 'EOF'
 package com.visualpathit.test;
 
 import org.junit.jupiter.api.Test;
@@ -110,8 +108,8 @@ public class BasicTest {
 }
 EOF
 
-                        # Create integration test
-                        cat > src/test/java/com/visualpathit/test/IntegrationTest.java << 'EOF'
+                    # Create integration test
+                    cat > src/test/java/com/visualpathit/test/IntegrationTest.java << 'EOF'
 package com.visualpathit.test;
 
 import org.junit.jupiter.api.Tag;
@@ -130,9 +128,8 @@ public class IntegrationTest {
 }
 EOF
 
-                        echo "✅ Test structure created successfully"
-                    '''
-                }
+                    echo "✅ Test structure created successfully"
+                '''
             }
         }
 
@@ -353,24 +350,11 @@ Build Information:
                         }
                     }
                 }
-                
-                success {
-                    echo "✅ Build & Tests completed successfully"
-                }
-                
-                failure {
-                    echo "❌ Build & Tests failed - continuing with fallback reports"
-                    // Don't fail the entire pipeline, just mark as unstable
-                    currentBuild.result = 'UNSTABLE'
-                }
             }
         }
 
         // Étape 6: Analyse qualité et sécurité du code
         stage('Code Quality & SAST') {
-            when {
-                expression { currentBuild.result != 'FAILURE' }
-            }
             steps {
                 script {
                     echo "🔧 Running SonarQube analysis..."
@@ -399,7 +383,10 @@ Build Information:
                     } catch (Exception e) {
                         echo "⚠️ SonarQube analysis failed: ${e.message}"
                         echo "🔄 Continuing pipeline without SonarQube analysis"
-                        currentBuild.result = 'UNSTABLE'
+                        // FIX: Use catchError instead of direct assignment
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                            error "SonarQube analysis failed but continuing"
+                        }
                     }
                 }
             }
@@ -409,7 +396,7 @@ Build Information:
         stage('Quality Gate') {
             when {
                 expression { 
-                    return currentBuild.result != 'FAILURE' && fileExists('.scannerwork/report-task.txt')
+                    return fileExists('.scannerwork/report-task.txt')
                 }
             }
             steps {
@@ -422,14 +409,19 @@ Build Information:
                                 if (params.ENFORCE_QUALITY_GATE) {
                                     error "Quality Gate failure: ${qg.status}"
                                 } else {
-                                    currentBuild.result = 'UNSTABLE'
+                                    // FIX: Use catchError for setting build result
+                                    catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                                        error "Quality Gate failed but continuing due to policy"
+                                    }
                                 }
                             } else {
                                 echo "✅ Quality Gate status: ${qg.status}"
                             }
                         } catch (Exception e) {
                             echo "⚠️ Quality Gate check failed or skipped: ${e.message}"
-                            currentBuild.result = 'UNSTABLE'
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                                error "Quality Gate check failed but continuing"
+                            }
                         }
                     }
                 }
@@ -438,9 +430,6 @@ Build Information:
 
         // Étape 8: Analyse des dépendances (SCA)
         stage('Dependency Analysis') {
-            when {
-                expression { currentBuild.result != 'FAILURE' }
-            }
             parallel {
                 stage('SCA - OWASP Dependency Check') {
                     steps {
@@ -533,9 +522,6 @@ Build Information:
 
         // Étape 9: Application des politiques de sécurité
         stage('Security Policy Enforcement') {
-            when {
-                expression { currentBuild.result != 'FAILURE' }
-            }
             steps {
                 script {
                     echo "⚖️ Applying security policies..."
@@ -628,10 +614,15 @@ Build Information:
                         error "Build failed due to ${totalCritical} CRITICAL vulnerabilities"
                     } else if (totalCritical > 0) {
                         echo "⚠️ CRITICAL vulnerabilities detected: ${totalCritical} (not failing build due to policy)"
-                        currentBuild.result = 'UNSTABLE'
+                        // FIX: Use catchError for setting build result
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                            error "Critical vulnerabilities found but continuing due to policy"
+                        }
                     } else if (totalHigh > 0) {
                         echo "⚠️ HIGH vulnerabilities detected: ${totalHigh}"
-                        currentBuild.result = currentBuild.result == null ? 'UNSTABLE' : currentBuild.result
+                        catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                            error "High vulnerabilities found"
+                        }
                     } else {
                         echo "✅ No critical/high vulnerabilities blocking the build"
                     }
