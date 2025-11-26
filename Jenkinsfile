@@ -389,42 +389,41 @@ EOF
         }
 
         // Étape 6: Analyse qualité et sécurité du code
-        stage('Code Quality & SAST') {
-            steps {
-                script {
-                    echo "🔧 Running SonarQube analysis with enhanced configuration..."
-                    
-                    try {
-                        withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
-                            withSonarQubeEnv('sonar-server') {
-                                sh """
-                                    echo "🔍 Starting SonarQube analysis..."
-                                    mvn -B sonar:sonar \
-                                        -Dsonar.projectKey=vprofile-application-${BUILD_NUMBER} \
-                                        -Dsonar.host.url=${SONAR_HOST_URL} \
-                                        -Dsonar.login=${SONAR_TOKEN} \
-                                        -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
-                                        -Dsonar.junit.reportsPath=target/surefire-reports \
-                                        -Dsonar.java.binaries=target/classes \
-                                        -Dsonar.java.test.binaries=target/test-classes \
-                                        -Dsonar.sourceEncoding=UTF-8 \
-                                        -Dsonar.java.source=17 \
-                                        -Dsonar.projectVersion=2.0 \
-                                        -Dsonar.scm.provider=git
-                                """
-                            }
-                        }
-                        echo "✅ SonarQube analysis completed successfully"
-                    } catch (Exception e) {
-                        echo "❌ SonarQube analysis failed: ${e.message}"
-                        echo "🔄 Continuing pipeline without SonarQube analysis"
-                        if (currentBuild.result != 'FAILURE') {
-                            currentBuild.result = 'UNSTABLE'
-                        }
+        // CORRECTION: Remplacer la section SonarQube avec des credentials sécurisés
+stage('Code Quality & SAST') {
+    steps {
+        script {
+            echo "🔧 Running SonarQube analysis with enhanced configuration..."
+            
+            try {
+                withSonarQubeEnv('sonar-server') {
+                    withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_AUTH_TOKEN')]) {
+                        sh '''
+                            echo "🔍 Starting SonarQube analysis..."
+                            mvn -B sonar:sonar \
+                                -Dsonar.projectKey=vprofile-application-${BUILD_NUMBER} \
+                                -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+                                -Dsonar.junit.reportsPath=target/surefire-reports \
+                                -Dsonar.java.binaries=target/classes \
+                                -Dsonar.java.test.binaries=target/test-classes \
+                                -Dsonar.sourceEncoding=UTF-8 \
+                                -Dsonar.java.source=17 \
+                                -Dsonar.projectVersion=2.0 \
+                                -Dsonar.scm.provider=git
+                        '''
                     }
+                }
+                echo "✅ SonarQube analysis completed successfully"
+            } catch (Exception e) {
+                echo "❌ SonarQube analysis failed: ${e.message}"
+                echo "🔄 Continuing pipeline without SonarQube analysis"
+                if (currentBuild.result != 'FAILURE') {
+                    currentBuild.result = 'UNSTABLE'
                 }
             }
         }
+    }
+}
 
         // Étape 7: Quality Gate conditionnelle
         stage('Quality Gate') {
