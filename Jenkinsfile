@@ -183,14 +183,16 @@ pipeline {
                     env.IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
                     timeout(time: 45, unit: 'MINUTES') {
                         retry(2) {
-                            sh '''
+                            sh """
                                 set -eu
                                 export DOCKER_BUILDKIT=1
-                                BASE_IMAGE=$(sed -n 's/^FROM[[:space:]]\+\([^[:space:]]\+\).*/\1/p' Dockerfile | head -n1 || true)
-                                [ -n "$BASE_IMAGE" ] && docker pull "$BASE_IMAGE" || true
+                                BASE_IMAGE=\$(grep '^FROM' Dockerfile | head -n1 | awk '{print \$2}' || true)
+                                if [ -n "\$BASE_IMAGE" ]; then
+                                    docker pull "\$BASE_IMAGE" || true
+                                fi
                                 docker build --network host --progress=plain --pull --cache-from ${params.IMAGE_NAME}:latest -t ${params.IMAGE_NAME}:latest .
                                 docker tag ${params.IMAGE_NAME}:latest ${env.IMAGE_TAG}
-                            '''
+                            """
                         }
                     }
                 }
@@ -361,35 +363,35 @@ pipeline {
                     sh "docker network rm ${env.NETWORK_NAME} || true"
 
                     sh "docker network create ${env.NETWORK_NAME} || true"
-                    sh '''
+                    sh """
                         docker run -d \
-                            --name ${CONTAINER_NAME} \
-                            --network ${NETWORK_NAME} \
-                            -p ${APP_PORT}:8080 \
-                            ${IMAGE_TAG} || true
-                    '''.replaceAll('\$\{CONTAINER_NAME\}', env.CONTAINER_NAME).replaceAll('\$\{NETWORK_NAME\}', env.NETWORK_NAME).replaceAll('\$\{APP_PORT\}', params.APP_PORT).replaceAll('\$\{IMAGE_TAG\}', env.IMAGE_TAG)
+                            --name ${env.CONTAINER_NAME} \
+                            --network ${env.NETWORK_NAME} \
+                            -p ${params.APP_PORT}:8080 \
+                            ${env.IMAGE_TAG} || true
+                    """
 
                     // Wait & healthcheck performed in one script for readability
-                    sh '''
+                    sh """
                         set +e
                         sleep 10
                         max_attempts=5
                         attempt=1
-                        while [ $attempt -le $max_attempts ]; do
-                            http_code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${APP_PORT}/ || echo "000")
-                            if echo "$http_code" | grep -qE "200|302|401|403"; then
-                                echo "Application is responding with HTTP code: $http_code"
+                        while [ \$attempt -le \$max_attempts ]; do
+                            http_code=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${params.APP_PORT}/ || echo "000")
+                            if echo "\$http_code" | grep -qE "200|302|401|403"; then
+                                echo "Application is responding with HTTP code: \$http_code"
                                 exit 0
                             else
-                                echo "Attempt $attempt: HTTP $http_code"
-                                attempt=$((attempt + 1))
+                                echo "Attempt \$attempt: HTTP \$http_code"
+                                attempt=\$((attempt + 1))
                                 sleep 10
                             fi
                         done
-                        echo "Application failed to respond after $max_attempts attempts"
-                        docker logs ${CONTAINER_NAME} || true
+                        echo "Application failed to respond after \$max_attempts attempts"
+                        docker logs ${env.CONTAINER_NAME} || true
                         exit 0
-                    '''.replaceAll('\$\{APP_PORT\}', params.APP_PORT).replaceAll('\$\{CONTAINER_NAME\}', env.CONTAINER_NAME)
+                    """
                 }
             }
         }
@@ -403,14 +405,14 @@ pipeline {
                     echo '🔍 Running OWASP ZAP baseline scan...'
                     def zapTarget = "http://localhost:${params.APP_PORT}"
 
-                    sh '''
-                        if docker inspect -f '{{.State.Status}}' ${CONTAINER_NAME} 2>/dev/null | grep -q running; then
+                    sh """
+                        if docker inspect -f '{{.State.Status}}' ${env.CONTAINER_NAME} 2>/dev/null | grep -q running; then
                             echo "Container is running, starting ZAP scan..."
                         else
                             echo "Container is not running, skipping ZAP scan"
                             exit 0
                         fi
-                    '''.replaceAll('\$\{CONTAINER_NAME\}', env.CONTAINER_NAME)
+                    """
 
                     sh """
                         docker run --rm --user root --network host \
