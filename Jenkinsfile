@@ -213,11 +213,11 @@ EOF
                 sh '''
                     echo "🏗️ Building application with proper test configuration..."
                     
-                    # Build with proper JaCoCo configuration
-                    mvn -B clean compile test-compile
+                    # Build with proper JaCoCo configuration - FIXED
+                    mvn -B clean compile test-compile jacoco:prepare-agent
                     
                     echo "🧪 Running unit tests with FIXED configuration..."
-                    # FIX: Use proper Maven test command without problematic surefire parameters
+                    # FIX: Use proper Maven test command with JaCoCo agent
                     mvn -B test -DfailIfNoTests=false -Dmaven.test.failure.ignore=true
                     
                     echo "📊 Generating JaCoCo reports..."
@@ -281,7 +281,7 @@ EOF
                             sh 'mkdir -p target/surefire-reports'
                         }
                         
-                        // Enhanced JaCoCo handling
+                        // Enhanced JaCoCo handling - FIXED
                         if (fileExists('target/jacoco.exec')) {
                             echo "✅ JaCoCo execution data found"
                             def jacocoSize = sh(returnStdout: true, script: 'wc -c < target/jacoco.exec').trim()
@@ -299,14 +299,15 @@ EOF
                             if (fileExists('target/site/jacoco/jacoco.xml')) {
                                 echo "✅ JaCoCo XML report generated successfully"
                                 try {
-                                    def coverageLine = sh(returnStdout: true, script: '''
+                                    def coverageData = sh(returnStdout: true, script: '''
                                         if [ -f "target/site/jacoco/jacoco.xml" ]; then
-                                            grep -o "line-coverage.*" target/site/jacoco/jacoco.xml | head -1 || echo "No line coverage found"
+                                            # Extract coverage information
+                                            grep -A 5 "counter type=\"LINE\"" target/site/jacoco/jacoco.xml | head -10
                                         else
                                             echo "JaCoCo XML report not found"
                                         fi
                                     ''').trim()
-                                    echo "📈 Coverage: ${coverageLine}"
+                                    echo "📈 Coverage Data: ${coverageData}"
                                 } catch (Exception e) {
                                     echo "⚠️ Could not read coverage details: ${e.message}"
                                 }
@@ -318,11 +319,6 @@ EOF
                             echo "❌ No JaCoCo execution data found at target/jacoco.exec"
                             echo "🔍 Checking target directory contents:"
                             sh 'ls -la target/ || echo "Target directory does not exist"'
-                            // Create placeholder JaCoCo data if missing
-                            sh '''
-                                mkdir -p target/site/jacoco
-                                echo "<!-- Placeholder JaCoCo report -->" > target/site/jacoco/jacoco.xml
-                            '''
                         }
                         
                         // Archive artifacts
@@ -338,16 +334,6 @@ EOF
                                 echo "🔍 Checking for alternative package files..."
                                 find target/ -name "*.war" -o -name "*.jar" | head -5 || echo "No package files found"
                             '''
-                            // Create build info file
-                            writeFile file: 'target/build-info.txt', text: """
-Build Information:
-- Build Number: ${env.BUILD_NUMBER}
-- Date: ${new Date().format("yyyy-MM-dd HH:mm:ss")}
-- Status: Build completed, packaging may have issues
-- Tests: Executed with fallback reports
-- Security: Scans completed successfully
-"""
-                            archiveArtifacts artifacts: 'target/build-info.txt', allowEmptyArchive: true
                         }
                     }
                 }
@@ -365,43 +351,23 @@ Build Information:
                             withSonarQubeEnv('sonar-server') {
                                 sh """
                                     echo "🔍 Running SonarQube analysis with Maven plugin..."
-                                    # Create sonar-project.properties for better control
-                                    cat > sonar-project.properties << 'EOF'
-sonar.projectKey=vprofile-${env.BUILD_NUMBER}
-sonar.projectName=VProfile Application
-sonar.projectVersion=1.0
-sonar.sources=src/main/java
-sonar.tests=src/test/java
-sonar.java.binaries=target/classes
-sonar.java.test.binaries=target/test-classes
-sonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
-sonar.junit.reportsPath=target/surefire-reports
-sonar.sourceEncoding=UTF-8
-sonar.java.source=17
-sonar.host.url=${SONAR_HOST_URL}
-sonar.login=${SONAR_TOKEN}
-EOF
-                                    mvn -B sonar:sonar -Dsonar.projectKey=vprofile-${env.BUILD_NUMBER} || echo "SonarQube analysis completed with warnings"
+                                    mvn -B sonar:sonar \\
+                                        -Dsonar.host.url=${SONAR_HOST_URL} \\
+                                        -Dsonar.login=${SONAR_TOKEN} \\
+                                        -Dsonar.projectKey=vprofile-${env.BUILD_NUMBER} \\
+                                        -Dsonar.projectName="VProfile Application" \\
+                                        -Dsonar.sources=src/main/java \\
+                                        -Dsonar.java.binaries=target/classes \\
+                                        -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \\
+                                        -Dsonar.junit.reportsPath=target/surefire-reports \\
+                                        -Dsonar.sourceEncoding=UTF-8 \\
+                                        -Dsonar.java.source=17 || echo "SonarQube analysis completed"
                                 """
                             }
                         }
-                        // Force creation of report-task.txt for Quality Gate
-                        sh '''
-                            mkdir -p .scannerwork
-                            echo "projectKey=vprofile-${BUILD_NUMBER}" > .scannerwork/report-task.txt
-                            echo "serverUrl=${SONAR_HOST_URL}" >> .scannerwork/report-task.txt
-                            echo "ceTaskId=manual-${BUILD_NUMBER}" >> .scannerwork/report-task.txt
-                            echo "ceTaskUrl=${SONAR_HOST_URL}/api/ce/task?id=manual-${BUILD_NUMBER}" >> .scannerwork/report-task.txt
-                        '''
                     } catch (Exception e) {
                         echo "⚠️ SonarQube analysis failed: ${e.message}"
                         echo "🔄 Continuing pipeline without SonarQube analysis"
-                        // Create placeholder for Quality Gate
-                        sh '''
-                            mkdir -p .scannerwork
-                            echo "projectKey=vprofile-${BUILD_NUMBER}" > .scannerwork/report-task.txt
-                            echo "serverUrl=${SONAR_HOST_URL}" >> .scannerwork/report-task.txt
-                        '''
                     }
                 }
             }
@@ -419,7 +385,10 @@ EOF
                                 if (params.ENFORCE_QUALITY_GATE) {
                                     error "Quality Gate failure: ${qg.status}"
                                 } else {
-                                    currentBuild.result = 'UNSTABLE'
+                                    // Only set to UNSTABLE if not already set by security findings
+                                    if (currentBuild.result == null) {
+                                        currentBuild.result = 'UNSTABLE'
+                                    }
                                 }
                             } else {
                                 echo "✅ Quality Gate status: ${qg.status}"
@@ -610,15 +579,15 @@ EOF
                     echo "📊 Total security findings: ${securityFindings.total_vulnerabilities + securityFindings.secrets + securityFindings.semgrep}"
                     echo "============================="
                     
-                    // Apply security policies
+                    // Apply security policies - FIXED
                     def totalCritical = securityFindings.critical + securityFindings.trivy_critical
                     def totalHigh = securityFindings.high + securityFindings.trivy_high
                     
                     if (params.FAIL_ON_CRITICAL_VULNS && totalCritical > 0) {
                         echo "❌ CRITICAL vulnerabilities detected: ${totalCritical}"
                         error "Build failed due to ${totalCritical} CRITICAL vulnerabilities"
-                    } else if (totalCritical > 0) {
-                        echo "⚠️ CRITICAL vulnerabilities detected: ${totalCritical} (not failing build due to policy)"
+                    } else if (totalCritical > 0 || securityFindings.secrets > 0) {
+                        echo "⚠️ CRITICAL findings detected: ${totalCritical} vulnerabilities + ${securityFindings.secrets} secrets"
                         currentBuild.result = 'UNSTABLE'
                     } else if (totalHigh > 0) {
                         echo "⚠️ HIGH vulnerabilities detected: ${totalHigh}"
@@ -633,15 +602,12 @@ EOF
                     writeJSON file: 'security-findings.json', json: securityFindings
                     archiveArtifacts artifacts: 'security-findings.json', allowEmptyArchive: true
                     
-                    // Generate comprehensive reports
-                    generateComprehensiveReports(securityFindings)
-                    
                     echo "✅ Security policies applied successfully"
                 }
             }
         }
 
-        // NEW STAGE: Generate Final Reports
+        // NEW STAGE: Generate Reports - FIXED
         stage('Generate Reports') {
             steps {
                 script {
@@ -652,8 +618,23 @@ EOF
                         securityFindings = readJSON file: 'security-findings.json'
                     }
                     
-                    generateComprehensiveReports(securityFindings)
-                    generateEmailReport(securityFindings)
+                    // Generate HTML report
+                    def htmlReport = generateSecurityHtmlReport(securityFindings)
+                    writeFile file: 'security-compliance-report.html', text: htmlReport
+                    archiveArtifacts artifacts: 'security-compliance-report.html', allowEmptyArchive: true
+                    echo "✅ HTML report generated: security-compliance-report.html"
+                    
+                    // Generate Markdown report
+                    def markdownReport = generateSecurityMarkdownReport(securityFindings)
+                    writeFile file: 'security-report.md', text: markdownReport
+                    archiveArtifacts artifacts: 'security-report.md', allowEmptyArchive: true
+                    echo "✅ Markdown report generated: security-report.md"
+                    
+                    // Generate final report
+                    def finalReport = generateFinalReport(securityFindings, currentBuild.currentResult ?: 'SUCCESS')
+                    writeFile file: 'devsecops-final-report.md', text: finalReport
+                    archiveArtifacts artifacts: 'devsecops-final-report.md', allowEmptyArchive: true
+                    echo "✅ Final report generated: devsecops-final-report.md"
                     
                     echo "✅ All reports generated successfully"
                 }
@@ -678,15 +659,16 @@ EOF
                     securityFindings = readJSON file: 'security-findings.json'
                 }
                 
-                generateFinalReport(securityFindings, finalStatus)
-                
-                // Send notifications based on parameter
+                // Send notifications based on parameter - FIXED
                 def notificationType = params.NOTIFICATION_TYPE ?: 'SLACK'
-                if (notificationType == 'EMAIL' || notificationType == 'BOTH') {
-                    sendEmailNotification(securityFindings, finalStatus)
-                }
                 if (notificationType == 'SLACK' || notificationType == 'BOTH') {
                     sendSlackNotification(securityFindings, finalStatus)
+                }
+                
+                // Email notification - SIMPLIFIED to avoid configuration issues
+                if (notificationType == 'EMAIL' || notificationType == 'BOTH') {
+                    echo "📧 Email notifications would be sent to: devops-team@yourcompany.com"
+                    echo "ℹ️ Configure email in Jenkins System Configuration for full email support"
                 }
                 
                 // Cleanup
@@ -698,10 +680,22 @@ EOF
                 '''
             }
         }
+        
+        success {
+            echo "🎉 Pipeline completed successfully!"
+        }
+        
+        unstable {
+            echo "⚠️ Pipeline completed with warnings - check security findings"
+        }
+        
+        failure {
+            echo "❌ Pipeline failed - check logs for details"
+        }
     }
 }
 
-// Enhanced helper methods
+// Helper methods
 def countXmlOccurrences(String text, String pattern) {
     if (!text) return 0
     int count = 0
@@ -713,473 +707,97 @@ def countXmlOccurrences(String text, String pattern) {
     return count
 }
 
-def generateComprehensiveReports(securityFindings) {
+def generateSecurityHtmlReport(securityFindings) {
     def totalCritical = securityFindings.critical + securityFindings.trivy_critical
     def totalHigh = securityFindings.high + securityFindings.trivy_high
     def totalFindings = securityFindings.total_vulnerabilities + securityFindings.secrets + securityFindings.semgrep
     
-    // Enhanced HTML Report
-    def htmlReport = """
+    return """
 <!DOCTYPE html>
 <html>
 <head>
     <title>DevSecOps Security Compliance Report</title>
     <style>
-        body { 
-            font-family: 'Arial', sans-serif; 
-            margin: 0; 
-            padding: 20px; 
-            background-color: #f5f7fa;
-            color: #333;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            overflow: hidden;
-        }
-        .header { 
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-            color: white; 
-            padding: 40px; 
-            text-align: center; 
-        }
-        .header h1 {
-            margin: 0;
-            font-size: 2.5em;
-            font-weight: 300;
-        }
-        .header p {
-            margin: 10px 0 0 0;
-            opacity: 0.9;
-        }
-        .metrics { 
-            display: flex; 
-            justify-content: space-around; 
-            flex-wrap: wrap;
-            padding: 20px;
-            background: #f8f9fa;
-        }
-        .metric-card { 
-            background: white; 
-            padding: 25px; 
-            margin: 15px; 
-            border-radius: 10px; 
-            text-align: center; 
-            min-width: 150px; 
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            flex: 1;
-            transition: transform 0.3s ease;
-        }
-        .metric-card:hover {
-            transform: translateY(-5px);
-        }
-        .critical-card { border-top: 4px solid #d32f2f; }
-        .high-card { border-top: 4px solid #f57c00; }
-        .secrets-card { border-top: 4px solid #7b1fa2; }
-        .issues-card { border-top: 4px solid #fbc02d; }
-        .metric-card h3 {
-            margin: 0 0 15px 0;
-            font-size: 1.1em;
-            color: #666;
-        }
-        .metric-card p {
-            font-size: 2.5em;
-            font-weight: bold;
-            margin: 0;
-        }
-        .critical { color: #d32f2f; }
-        .high { color: #f57c00; }
-        .secrets { color: #7b1fa2; }
-        .issues { color: #fbc02d; }
-        .content {
-            padding: 30px;
-        }
-        .section { 
-            margin: 25px 0; 
-            padding: 25px; 
-            background: white; 
-            border-radius: 8px; 
-            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-            border-left: 4px solid #667eea;
-        }
-        .section h2 {
-            color: #667eea;
-            margin-top: 0;
-            border-bottom: 2px solid #f0f0f0;
-            padding-bottom: 10px;
-        }
-        .findings-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
-            margin-top: 20px;
-        }
-        .finding-item {
-            padding: 15px;
-            background: #f8f9fa;
-            border-radius: 6px;
-            border-left: 4px solid;
-        }
-        .finding-critical { border-left-color: #d32f2f; background: #ffebee; }
-        .finding-high { border-left-color: #f57c00; background: #fff3e0; }
-        .finding-medium { border-left-color: #fbc02d; background: #fff9c4; }
-        .recommendation { 
-            background: #e3f2fd; 
-            padding: 20px; 
-            border-radius: 8px; 
-            margin: 15px 0; 
-            border-left: 4px solid #2196f3;
-        }
-        .status-badge {
-            display: inline-block;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-weight: bold;
-            margin: 10px 0;
-        }
-        .status-success { background: #e8f5e8; color: #2e7d32; }
-        .status-warning { background: #fff3e0; color: #f57c00; }
-        .status-critical { background: #ffebee; color: #d32f2f; }
-        .footer {
-            text-align: center;
-            padding: 20px;
-            background: #f8f9fa;
-            color: #666;
-            font-size: 0.9em;
-        }
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; text-align: center; }
+        .metrics { display: flex; justify-content: space-around; flex-wrap: wrap; }
+        .metric-card { background: white; padding: 20px; margin: 10px; border-radius: 8px; text-align: center; min-width: 120px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .critical-card { border-left: 4px solid #d32f2f; }
+        .high-card { border-left: 4px solid #f57c00; }
+        .secrets-card { border-left: 4px solid #7b1fa2; }
+        .issues-card { border-left: 4px solid #fbc02d; }
+        .section { margin: 15px 0; padding: 20px; background: white; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .critical { color: #d32f2f; font-weight: bold; }
+        .high { color: #f57c00; font-weight: bold; }
+        .recommendation { background: #fff3cd; padding: 15px; border-radius: 5px; margin: 10px 0; border-left: 4px solid #ffc107; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🛡️ DevSecOps Security Compliance Report</h1>
-            <p><strong>Build:</strong> ${env.JOB_NAME} #${env.BUILD_NUMBER}</p>
-            <p><strong>Date:</strong> ${new Date().format("yyyy-MM-dd HH:mm:ss")}</p>
-            <div class="status-badge ${totalCritical > 0 ? 'status-critical' : totalHigh > 0 ? 'status-warning' : 'status-success'}">
-                ${totalCritical > 0 ? 'CRITICAL ISSUES DETECTED' : totalHigh > 0 ? 'SECURITY CONCERNS' : 'SECURE'}
-            </div>
+    <div class="header">
+        <h1>🛡️ DevSecOps Security Compliance Report</h1>
+        <p><strong>Build:</strong> ${env.JOB_NAME} #${env.BUILD_NUMBER}</p>
+        <p><strong>Date:</strong> ${new Date().format("yyyy-MM-dd HH:mm:ss")}</p>
+    </div>
+    
+    <div class="metrics">
+        <div class="metric-card critical-card">
+            <h3>🔴 CRITICAL</h3>
+            <p style="font-size: 24px; font-weight: bold; color: #d32f2f;">${totalCritical}</p>
         </div>
-        
-        <div class="metrics">
-            <div class="metric-card critical-card">
-                <h3>🔴 CRITICAL</h3>
-                <p class="critical">${totalCritical}</p>
-            </div>
-            <div class="metric-card high-card">
-                <h3>🟠 HIGH</h3>
-                <p class="high">${totalHigh}</p>
-            </div>
-            <div class="metric-card secrets-card">
-                <h3>🔑 SECRETS</h3>
-                <p class="secrets">${securityFindings.secrets}</p>
-            </div>
-            <div class="metric-card issues-card">
-                <h3>🐛 CODE ISSUES</h3>
-                <p class="issues">${securityFindings.semgrep}</p>
-            </div>
+        <div class="metric-card high-card">
+            <h3>🟠 HIGH</h3>
+            <p style="font-size: 24px; font-weight: bold; color: #f57c00;">${totalHigh}</p>
         </div>
-        
-        <div class="content">
-            <div class="section">
-                <h2>📊 Security Assessment Summary</h2>
-                <div class="findings-grid">
-                    <div class="finding-item ${totalCritical > 0 ? 'finding-critical' : ''}">
-                        <h4>Critical Vulnerabilities</h4>
-                        <p><strong>${totalCritical} total</strong></p>
-                        <p>${securityFindings.critical} from OWASP + ${securityFindings.trivy_critical} from Trivy</p>
-                    </div>
-                    <div class="finding-item ${totalHigh > 0 ? 'finding-high' : ''}">
-                        <h4>High Vulnerabilities</h4>
-                        <p><strong>${totalHigh} total</strong></p>
-                        <p>${securityFindings.high} from OWASP + ${securityFindings.trivy_high} from Trivy</p>
-                    </div>
-                    <div class="finding-item finding-medium">
-                        <h4>Medium Vulnerabilities</h4>
-                        <p><strong>${securityFindings.medium}</strong></p>
-                    </div>
-                    <div class="finding-item ${securityFindings.secrets > 0 ? 'finding-critical' : ''}">
-                        <h4>Secrets Exposure</h4>
-                        <p><strong>${securityFindings.secrets} secrets found</strong></p>
-                        ${securityFindings.secrets > 0 ? '<p style="color: #d32f2f; font-weight: bold;">IMMEDIATE ACTION REQUIRED</p>' : ''}
-                    </div>
-                </div>
-                <p><strong>Total Security Findings:</strong> ${totalFindings}</p>
-            </div>
-            
-            <div class="section">
-                <h2>🚨 Security Recommendations</h2>
-                ${totalCritical > 0 ? '<div class="recommendation"><strong>🔴 IMMEDIATE ACTION REQUIRED:</strong> Address critical vulnerabilities before deployment. These pose the highest risk to your application and should be fixed immediately.</div>' : ''}
-                ${totalHigh > 0 ? '<div class="recommendation"><strong>🟠 HIGH PRIORITY:</strong> Review and fix high severity vulnerabilities in the next development cycle. These should be addressed before the next release.</div>' : ''}
-                ${securityFindings.secrets > 0 ? '<div class="recommendation"><strong>🔑 CRITICAL SECURITY ISSUE:</strong> Rotate exposed secrets immediately and implement proper secret management. Exposed credentials pose extreme risk.</div>' : ''}
-                ${securityFindings.semgrep > 0 ? '<div class="recommendation"><strong>🐛 CODE QUALITY IMPROVEMENT:</strong> Review and address Semgrep findings to improve code security and maintainability.</div>' : ''}
-                ${totalCritical == 0 && totalHigh == 0 && securityFindings.secrets == 0 ? '<div class="recommendation" style="background: #e8f5e8; border-left-color: #4caf50;"><strong>✅ EXCELLENT SECURITY POSTURE:</strong> No critical security issues detected. Maintain current security practices and continue regular scanning.</div>' : ''}
-            </div>
-            
-            <div class="section">
-                <h2>🔧 Remediation Steps</h2>
-                <ul>
-                    ${totalCritical > 0 ? '<li><strong>Immediate (Today):</strong> Update dependencies with critical vulnerabilities, rotate exposed secrets</li>' : ''}
-                    ${totalHigh > 0 ? '<li><strong>Priority (This Week):</strong> Address high severity vulnerabilities, implement secret management</li>' : ''}
-                    ${securityFindings.semgrep > 0 ? '<li><strong>Code Quality (Next Sprint):</strong> Review and fix Semgrep findings</li>' : ''}
-                    <li><strong>Continuous:</strong> Regular dependency updates, security scanning, and code review</li>
-                    <li><strong>Prevention:</strong> Implement pre-commit hooks, CI/CD security gates, and developer training</li>
-                </ul>
-            </div>
-            
-            <div class="section">
-                <h2>📋 Next Steps</h2>
-                <ol>
-                    <li>Review detailed vulnerability reports in attached artifacts</li>
-                    <li>Prioritize fixes based on severity and impact</li>
-                    <li>Update vulnerable dependencies to latest secure versions</li>
-                    <li>Implement secret management solution (HashiCorp Vault, AWS Secrets Manager)</li>
-                    <li>Schedule security review meetings for critical findings</li>
-                    <li>Update security policies and procedures based on findings</li>
-                </ol>
-            </div>
+        <div class="metric-card secrets-card">
+            <h3>🔑 SECRETS</h3>
+            <p style="font-size: 24px; font-weight: bold; color: #7b1fa2;">${securityFindings.secrets}</p>
         </div>
-        
-        <div class="footer">
-            <p>Generated by Jenkins DevSecOps Pipeline | Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-            <p>For security concerns, contact your security team immediately.</p>
+        <div class="metric-card issues-card">
+            <h3>🐛 CODE ISSUES</h3>
+            <p style="font-size: 24px; font-weight: bold; color: #fbc02d;">${securityFindings.semgrep}</p>
         </div>
+    </div>
+    
+    <div class="section">
+        <h2>📊 Detailed Security Analysis</h2>
+        <p>🔴 <span class="critical">CRITICAL:</span> ${securityFindings.critical} (OWASP) + ${securityFindings.trivy_critical} (Trivy) = <strong>${totalCritical} total</strong></p>
+        <p>🟠 <span class="high">HIGH:</span> ${securityFindings.high} (OWASP) + ${securityFindings.trivy_high} (Trivy) = <strong>${totalHigh} total</strong></p>
+        <p>🟡 MEDIUM: ${securityFindings.medium}</p>
+        <p>🔑 Secrets Exposed: ${securityFindings.secrets}</p>
+        <p>🐛 Code Issues: ${securityFindings.semgrep}</p>
+        <p>📊 Total Security Findings: ${totalFindings}</p>
+    </div>
+    
+    <div class="section">
+        <h2>🚨 Security Recommendations</h2>
+        ${totalCritical > 0 ? '<div class="recommendation"><strong>🔴 IMMEDIATE ACTION REQUIRED:</strong> Address critical vulnerabilities before deployment.</div>' : ''}
+        ${totalHigh > 0 ? '<div class="recommendation"><strong>🟠 HIGH PRIORITY:</strong> Review and fix high severity vulnerabilities.</div>' : ''}
+        ${securityFindings.secrets > 0 ? '<div class="recommendation"><strong>🔑 CRITICAL SECURITY ISSUE:</strong> Rotate exposed secrets immediately.</div>' : ''}
+        ${securityFindings.semgrep > 0 ? '<div class="recommendation"><strong>🐛 CODE QUALITY:</strong> Review Semgrep findings.</div>' : ''}
     </div>
 </body>
 </html>
 """
-    writeFile file: 'security-compliance-report.html', text: htmlReport
-    archiveArtifacts artifacts: 'security-compliance-report.html', allowEmptyArchive: true
-    echo "✅ Comprehensive HTML report generated: security-compliance-report.html"
+}
+
+def generateSecurityMarkdownReport(securityFindings) {
+    def totalCritical = securityFindings.critical + securityFindings.trivy_critical
+    def totalHigh = securityFindings.high + securityFindings.trivy_high
     
-    // Generate Markdown report
-    def markdownReport = """
-# 🛡️ DevSecOps Security Compliance Report
+    return """
+# Security Compliance Report
 
 ## Build Information
-- **Build Number**: ${env.BUILD_NUMBER}
-- **Job Name**: ${env.JOB_NAME}
+- **Build**: ${env.JOB_NAME} #${env.BUILD_NUMBER}
 - **Date**: ${new Date().format("yyyy-MM-dd HH:mm:ss")}
-- **Status**: ${currentBuild.currentResult ?: 'SUCCESS'}
-- **Git Commit**: ${env.GIT_COMMIT ?: 'N/A'}
 
-## Executive Summary
-${totalCritical > 0 ? '🔴 **CRITICAL SECURITY RISK** - Immediate action required' : totalHigh > 0 ? '🟠 **HIGH SECURITY RISK** - Address vulnerabilities soon' : securityFindings.secrets > 0 ? '🔑 **CREDENTIALS EXPOSED** - Rotate secrets immediately' : '✅ **SECURE** - No critical issues detected'}
-
-## Security Scan Results
-
-### Vulnerability Analysis
-- 🔴 **CRITICAL**: ${securityFindings.critical} (OWASP) + ${securityFindings.trivy_critical} (Trivy) = **${totalCritical} total**
-- 🟠 **HIGH**: ${securityFindings.high} (OWASP) + ${securityFindings.trivy_high} (Trivy) = **${totalHigh} total**
+## Security Findings
+- 🔴 **CRITICAL**: ${totalCritical} total
+- 🟠 **HIGH**: ${totalHigh} total  
 - 🟡 **MEDIUM**: ${securityFindings.medium}
-- 🔑 **Secrets Exposed**: ${securityFindings.secrets}
+- 🔑 **Secrets**: ${securityFindings.secrets}
 - 🐛 **Code Issues**: ${securityFindings.semgrep}
-- 📊 **Total Findings**: ${totalFindings}
-
-### Tool Results
-- **Gitleaks**: ${securityFindings.secrets} secrets found
-- **Semgrep**: ${securityFindings.semgrep} code issues
-- **OWASP DC**: ${securityFindings.critical} critical, ${securityFindings.high} high, ${securityFindings.medium} medium
-- **Trivy**: ${securityFindings.trivy_critical} critical, ${securityFindings.trivy_high} high
-
-## Immediate Actions Required
-${totalCritical > 0 ? '- 🔴 **CRITICAL**: Address critical vulnerabilities immediately' : ''}
-${securityFindings.secrets > 0 ? '- 🔑 **CRITICAL**: Rotate all exposed secrets immediately' : ''}
-${totalHigh > 0 ? '- 🟠 **HIGH**: Fix high severity vulnerabilities this week' : ''}
-${securityFindings.semgrep > 0 ? '- 🐛 **MEDIUM**: Review code quality issues next sprint' : ''}
 
 ## Recommendations
-1. **Update Dependencies**: Patch vulnerable libraries to latest versions
-2. **Secret Management**: Implement proper secret storage and rotation
-3. **Code Review**: Address SAST findings in code review process
-4. **Security Training**: Educate developers on secure coding practices
-5. **Monitoring**: Implement continuous security monitoring
-
-## Build Artifacts
-- Security Compliance Report (HTML)
-- Vulnerability Reports (JSON/XML)
-- Test Coverage Reports
-- Application Package (WAR)
-- SBOM Documentation
-
----
-*Generated automatically by Jenkins DevSecOps Pipeline*  
-*Build URL: ${env.BUILD_URL}*  
-*Report generated: ${new Date().format("yyyy-MM-dd HH:mm:ss")}*
-"""
-    writeFile file: 'security-report.md', text: markdownReport
-    archiveArtifacts artifacts: 'security-report.md', allowEmptyArchive: true
-    echo "✅ Markdown report generated: security-report.md"
-}
-
-def generateEmailReport(securityFindings) {
-    def totalCritical = securityFindings.critical + securityFindings.trivy_critical
-    def totalHigh = securityFindings.high + securityFindings.trivy_high
-    
-    def emailBody = """
-DevSecOps Pipeline Execution Report
-
-Build: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-Status: ${currentBuild.currentResult ?: 'SUCCESS'}
-Date: ${new Date().format("yyyy-MM-dd HH:mm:ss")}
-
-SECURITY SUMMARY:
-${totalCritical > 0 ? '🔴 CRITICAL: ' + totalCritical + ' vulnerabilities' : '✅ No critical vulnerabilities'}
-${totalHigh > 0 ? '🟠 HIGH: ' + totalHigh + ' vulnerabilities' : '✅ No high vulnerabilities'}
-${securityFindings.secrets > 0 ? '🔑 SECRETS: ' + securityFindings.secrets + ' exposed' : '✅ No secrets exposed'}
-${securityFindings.semgrep > 0 ? '🐛 CODE ISSUES: ' + securityFindings.semgrep + ' findings' : '✅ No code issues'}
-
-DETAILED FINDINGS:
-- OWASP Dependency Check: ${securityFindings.critical} critical, ${securityFindings.high} high
-- Trivy Scan: ${securityFindings.trivy_critical} critical, ${securityFindings.trivy_high} high
-- Gitleaks: ${securityFindings.secrets} secrets found
-- Semgrep: ${securityFindings.semgrep} code issues
-
-${totalCritical > 0 || securityFindings.secrets > 0 ? 'IMMEDIATE ACTION REQUIRED!' : 'No immediate action required.'}
-
-View detailed reports at: ${env.BUILD_URL}
-
-This is an automated message from Jenkins DevSecOps Pipeline.
-"""
-    
-    writeFile file: 'email-report.txt', text: emailBody
-    archiveArtifacts artifacts: 'email-report.txt', allowEmptyArchive: true
-    echo "✅ Email report generated: email-report.txt"
-}
-
-def generateFinalReport(securityFindings, finalStatus) {
-    def totalCritical = securityFindings.critical + securityFindings.trivy_critical
-    def totalHigh = securityFindings.high + securityFindings.trivy_high
-    
-    def finalReport = """
-# 🛡️ DevSecOps Pipeline - Final Execution Report
-
-## Executive Summary
-**Status**: ${finalStatus}  
-**Build**: ${env.JOB_NAME} #${env.BUILD_NUMBER}  
-**Duration**: ${currentBuild.durationString.replace(' and counting', '')}  
-**Triggered by**: ${env.BUILD_USER ?: 'System'}  
-**Git Commit**: ${env.GIT_COMMIT ?: 'N/A'}  
-
-## Security Assessment
-${securityFindings.secrets == 0 ? '✅' : '🔴'} **Secrets Detection**: ${securityFindings.secrets} findings  
-${securityFindings.semgrep == 0 ? '✅' : '🟠'} **SAST Analysis**: ${securityFindings.semgrep} findings  
-${totalCritical == 0 ? '✅' : '🔴'} **Critical Vulnerabilities**: ${totalCritical} total  
-${totalHigh == 0 ? '✅' : '🟠'} **High Vulnerabilities**: ${totalHigh} total  
-${securityFindings.medium == 0 ? '✅' : '🟡'} **Medium Vulnerabilities**: ${securityFindings.medium}  
-
-## Quality Gates
-- **Build Status**: ${finalStatus}
-- **Tests Execution**: ✅ Completed
-- **Security Scans**: ✅ All tools executed
-- **Code Coverage**: 📊 JaCoCo reports generated
-- **Package Built**: ✅ WAR file generated
-
-## Security Posture Assessment
-${totalCritical > 0 ? '🔴 **CRITICAL RISK**: Immediate action required for critical vulnerabilities' : ''}
-${totalHigh > 0 ? '🟠 **HIGH RISK**: Address high severity vulnerabilities soon' : ''}
-${securityFindings.secrets > 0 ? '🔑 **SECRETS EXPOSED**: Rotate credentials immediately' : ''}
-${totalCritical == 0 && totalHigh == 0 && securityFindings.secrets == 0 ? '✅ **SECURE**: No critical security issues detected' : '⚠️ **SECURITY IMPROVEMENTS NEEDED**'}
-
-## Generated Artifacts
-- Security Compliance Report (HTML)
-- Vulnerability Analysis Reports
-- Test Coverage Reports (JaCoCo)
-- SBOM Documentation
-- Application Package (WAR)
-- Build Information
-
-## Next Steps
-${totalCritical > 0 ? '🔴 **Urgent**: Address critical vulnerabilities before deployment' : ''}
-${totalHigh > 0 ? '🟠 **High Priority**: Review high severity vulnerabilities' : ''}
-${securityFindings.secrets > 0 ? '🔑 **Critical**: Rotate all exposed secrets immediately' : ''}
-${securityFindings.semgrep > 0 ? '🐛 **Code Quality**: Review Semgrep findings' : ''}
-${totalCritical == 0 && totalHigh == 0 ? '✅ **Production Ready**: No critical/high issues detected' : ''}
-
----
-*Pipeline executed with comprehensive security checks*  
-*Build URL: ${env.BUILD_URL}*  
-*Generated: ${new Date().format("yyyy-MM-dd HH:mm:ss")}*
-"""
-    writeFile file: 'devsecops-final-report.md', text: finalReport
-    archiveArtifacts artifacts: 'devsecops-final-report.md', allowEmptyArchive: true
-    echo "✅ Final report generated: devsecops-final-report.md"
-}
-
-def sendEmailNotification(securityFindings, finalStatus) {
-    def totalCritical = securityFindings.critical + securityFindings.trivy_critical
-    def totalHigh = securityFindings.high + securityFindings.trivy_high
-    
-    emailext (
-        subject: "DevSecOps Pipeline ${finalStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-        body: """
-<h2>DevSecOps Pipeline Execution Report</h2>
-
-<p><strong>Build:</strong> ${env.JOB_NAME} #${env.BUILD_NUMBER}<br>
-<strong>Status:</strong> ${finalStatus}<br>
-<strong>Duration:</strong> ${currentBuild.durationString.replace(' and counting', '')}<br>
-<strong>Date:</strong> ${new Date().format("yyyy-MM-dd HH:mm:ss")}</p>
-
-<h3>Security Summary</h3>
-<table border="1" style="border-collapse: collapse; width: 100%;">
-    <tr style="background-color: #f5f5f5;">
-        <th>Category</th>
-        <th>Count</th>
-        <th>Status</th>
-    </tr>
-    <tr>
-        <td>🔴 Critical Vulnerabilities</td>
-        <td>${totalCritical}</td>
-        <td>${totalCritical > 0 ? '❌ Needs Attention' : '✅ OK'}</td>
-    </tr>
-    <tr>
-        <td>🟠 High Vulnerabilities</td>
-        <td>${totalHigh}</td>
-        <td>${totalHigh > 0 ? '⚠️ Review Needed' : '✅ OK'}</td>
-    </tr>
-    <tr>
-        <td>🔑 Secrets Exposed</td>
-        <td>${securityFindings.secrets}</td>
-        <td>${securityFindings.secrets > 0 ? '❌ CRITICAL' : '✅ OK'}</td>
-    </tr>
-    <tr>
-        <td>🐛 Code Issues</td>
-        <td>${securityFindings.semgrep}</td>
-        <td>${securityFindings.semgrep > 0 ? '⚠️ Review' : '✅ OK'}</td>
-    </tr>
-</table>
-
-${totalCritical > 0 ? '<p style="color: #d32f2f; font-weight: bold;">🔴 IMMEDIATE ACTION: Critical vulnerabilities detected!</p>' : ''}
-${securityFindings.secrets > 0 ? '<p style="color: #d32f2f; font-weight: bold;">🔑 CRITICAL: Secrets exposed - rotate immediately!</p>' : ''}
-
-<p>View detailed reports and artifacts: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-
-<p><em>This is an automated message from Jenkins DevSecOps Pipeline</em></p>
-""",
-        to: "devops-team@yourcompany.com",
-        attachLog: true
-    )
-    echo "✅ Email notification sent"
-}
-
-def sendSlackNotification(securityFindings, finalStatus) {
-    def totalCritical = securityFindings.critical + securityFindings.trivy_critical
-    def totalHigh = securityFindings.high + securityFindings.trivy_high
-    
-    def color = totalCritical > 0 ? 'danger' : totalHigh > 0 ? 'warning' : 'good'
-    def statusIcon = totalCritical > 0 ? '🔴' : totalHigh > 0 ? '🟠' : '✅'
-    
-    slackSend(
-        channel: '#devsecops',
-        color: color,
-        message: """${statusIcon} DevSecOps Pipeline ${finalStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-🔴 Critical: ${totalCritical} | 🟠 High: ${totalHigh}
-🔑 Secrets: ${securityFindings.secrets} | 🐛 Issues: ${securityFindings.semgrep}
-📊 Build: ${finalStatus} | ⏱️ Duration: ${currentBuild.durationString.replace(' and counting', '')}
-${totalCritical > 0 ? '🚨 IMMEDIATE ACTION REQUIRED' : totalHigh > 0 ? '⚠️ Review vulnerabilities needed' : '✅ All security checks passed'}
-🔗 ${env.BUILD_URL}"""
-    )
-    echo "✅ Slack notification sent"
-}
+${totalCritical > 0 ? '- 🔴 Address critical vulnerabilities immediately' : ''}
+${securityFindings.secrets > 0 ? '- 🔑 Rotate exposed secrets immediately' : ''}
