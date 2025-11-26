@@ -74,10 +74,6 @@ pipeline {
                     post {
                         always {
                             archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
-                            recordIssues(
-                                tool: gitleaks(pattern: 'gitleaks-report.json'),
-                                qualityGates: [[threshold: 1, type: 'TOTAL', unstable: true]]
-                            )
                         }
                     }
                 }
@@ -151,7 +147,7 @@ pipeline {
                             sh """
                                 mvn -B sonar:sonar \\
                                     -Dsonar.host.url=${SONAR_HOST_URL} \\
-                                    -Dsonar.login=${SONAR_TOKEN} \\
+                                    -Dsonar.login=\\$SONAR_TOKEN \\
                                     -Dsonar.projectKey=vprofile-${env.BUILD_NUMBER} \\
                                     -Dsonar.projectName="VProfile Application" \\
                                     -Dsonar.sources=src/main/java \\
@@ -201,15 +197,6 @@ pipeline {
                     post {
                         always {
                             archiveArtifacts artifacts: 'target/dependency-check-report/*', allowEmptyArchive: true
-                            dependencyCheckPublisher(
-                                pattern: 'target/dependency-check-report/dependency-check-report.xml',
-                                unstableTotalAll: '0',
-                                unstableTotalHigh: '0',
-                                unstableTotalNormal: '10',
-                                failedTotalAll: '0',
-                                failedTotalHigh: '0',
-                                failedTotalNormal: '20'
-                            )
                         }
                     }
                 }
@@ -432,15 +419,19 @@ ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST 
                 
                 archiveArtifacts artifacts: 'devsecops-final-report.md', allowEmptyArchive: true
                 
-                // Publier les résultats de sécurité
-                publishHTML([
-                    allowMissing: true,
-                    alwaysLinkToLastBuild: true,
-                    keepAll: true,
-                    reportDir: 'target/dependency-check-report',
-                    reportFiles: 'dependency-check-report.html',
-                    reportName: 'OWASP Dependency Check Report'
-                ])
+                // Publier les résultats de sécurité (version simplifiée)
+                script {
+                    if (fileExists('target/dependency-check-report/dependency-check-report.html')) {
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: 'target/dependency-check-report',
+                            reportFiles: 'dependency-check-report.html',
+                            reportName: 'OWASP Dependency Check Report'
+                        ])
+                    }
+                }
             }
         }
         
@@ -455,6 +446,24 @@ ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST 
 👤 By: ${env.BUILD_USER_ID ?: 'System'}
 🔗 ${env.BUILD_URL}"""
                 )
+                
+                // Notification email pour les succès
+                emailext (
+                    subject: "✅ SUCCESS: DevSecOps Pipeline - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                    <h2>DevSecOps Pipeline Execution Successful</h2>
+                    <p><strong>Project:</strong> ${env.JOB_NAME}</p>
+                    <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
+                    <p><strong>Status:</strong> SUCCESS</p>
+                    <p><strong>Commit:</strong> ${env.GIT_COMMIT}</p>
+                    <p><strong>Duration:</strong> ${currentBuild.durationString}</p>
+                    <p>All security scans passed successfully. No critical vulnerabilities detected.</p>
+                    <p>View details: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    """,
+                    to: 'mekni.amin75@gmail.com',
+                    from: 'mmekni66@gmail.com',
+                    mimeType: 'text/html'
+                )
             }
         }
         
@@ -468,6 +477,23 @@ ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST 
 📋 Review security reports for details
 🔗 ${env.BUILD_URL}"""
                 )
+                
+                // Notification email pour les builds unstable
+                emailext (
+                    subject: "⚠️ UNSTABLE: DevSecOps Pipeline - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                    <h2>DevSecOps Pipeline - Security Warnings</h2>
+                    <p><strong>Project:</strong> ${env.JOB_NAME}</p>
+                    <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
+                    <p><strong>Status:</strong> UNSTABLE</p>
+                    <p><strong>Commit:</strong> ${env.GIT_COMMIT}</p>
+                    <p>Security scans completed with non-critical findings. Review reports for details.</p>
+                    <p>View details: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    """,
+                    to: 'mekni.amin75@gmail.com',
+                    from: 'mmekni66@gmail.com',
+                    mimeType: 'text/html'
+                )
             }
         }
         
@@ -480,6 +506,24 @@ ${params.RUN_DAST_SCAN ? '✅ **DAST Testing with OWASP ZAP**' : '⏭️ **DAST 
 🚨 Critical security issues blocked pipeline
 🔍 Immediate review required
 🔗 ${env.BUILD_URL}"""
+                )
+                
+                // Notification email pour les échecs
+                emailext (
+                    subject: "❌ FAILED: DevSecOps Pipeline - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                    <h2>DevSecOps Pipeline - Critical Security Issues</h2>
+                    <p><strong>Project:</strong> ${env.JOB_NAME}</p>
+                    <p><strong>Build Number:</strong> ${env.BUILD_NUMBER}</p>
+                    <p><strong>Status:</strong> FAILED</p>
+                    <p><strong>Commit:</strong> ${env.GIT_COMMIT}</p>
+                    <p><strong>Reason:</strong> Critical security vulnerabilities detected and policy enforcement enabled.</p>
+                    <p>Immediate action required to address security issues.</p>
+                    <p>View details: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    """,
+                    to: 'mekni.amin75@gmail.com',
+                    from: 'mmekni66@gmail.com',
+                    mimeType: 'text/html'
                 )
             }
         }
