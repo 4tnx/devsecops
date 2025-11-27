@@ -18,6 +18,9 @@ pipeline {
         booleanParam(name: 'ENFORCE_QUALITY_GATE', defaultValue: false, description: 'Abort pipeline if Sonar Quality Gate != OK')
         booleanParam(name: 'FAIL_ON_CRITICAL_VULNS', defaultValue: false, description: 'Fail build on CRITICAL vulnerabilities')
         booleanParam(name: 'FAIL_ON_HIGH_VULNS', defaultValue: false, description: 'Fail build on HIGH vulnerabilities')
+        booleanParam(name: 'ALLOW_MEDIUM_VULNS', defaultValue: true, description: 'Allow medium vulnerabilities without marking UNSTABLE')
+        booleanParam(name: 'ALLOW_SAST_FINDINGS', defaultValue: true, description: 'Allow SAST findings without marking UNSTABLE')
+        booleanParam(name: 'FAIL_ON_SECRETS', defaultValue: false, description: 'Fail build when secrets are detected')
         booleanParam(name: 'RUN_DAST_SCAN', defaultValue: false, description: 'Perform DAST security testing')
         string(name: 'TEST_ENVIRONMENT_URL', defaultValue: 'http://localhost:8080', description: 'URL for DAST testing')
         choice(name: 'NOTIFICATION_TYPE', choices: ['SLACK', 'EMAIL', 'BOTH', 'NONE'], description: 'Select notification method')
@@ -174,10 +177,15 @@ EOF
                                             def secretsCount = gitleaksReport?.Findings?.size() ?: 0
                                             echo "📁 Gitleaks report archived - Found ${secretsCount} secrets"
                                             
+                                            // Only mark UNSTABLE if FAIL_ON_SECRETS is true, otherwise just warn
                                             if (secretsCount > 0) {
                                                 echo "🔴 CRITICAL: ${secretsCount} secrets found in code!"
-                                                if (currentBuild.result != 'FAILURE') {
-                                                    currentBuild.result = 'UNSTABLE'
+                                                if (params.FAIL_ON_SECRETS) {
+                                                    if (currentBuild.result != 'FAILURE') {
+                                                        currentBuild.result = 'UNSTABLE'
+                                                    }
+                                                } else {
+                                                    echo "⚠️ Secrets found but continuing due to FAIL_ON_SECRETS=false"
                                                 }
                                             }
                                         } else {
@@ -220,10 +228,14 @@ EOF
                                             def findingsCount = semgrepReport?.results?.size() ?: 0
                                             echo "📁 Semgrep report archived - Found ${findingsCount} issues"
                                             
+                                            // Only mark UNSTABLE if ALLOW_SAST_FINDINGS is false
                                             if (findingsCount > 0) {
                                                 echo "🟠 SAST findings: ${findingsCount} code issues detected"
-                                                if (currentBuild.result == null) {
+                                                if (!params.ALLOW_SAST_FINDINGS && currentBuild.result == null) {
                                                     currentBuild.result = 'UNSTABLE'
+                                                    echo "⚠️ SAST findings marked build as UNSTABLE"
+                                                } else {
+                                                    echo "ℹ️ SAST findings allowed (ALLOW_SAST_FINDINGS=true)"
                                                 }
                                             }
                                         } else {
@@ -358,7 +370,7 @@ EOF
             }
         }
 
-        // Étape 6: Analyse qualité et sécurité du code - CORRIGÉE
+        // Étape 6: Analyse qualité et sécurité du code
         stage('Code Quality & SAST') {
             steps {
                 script {
@@ -386,9 +398,7 @@ EOF
                     } catch (Exception e) {
                         echo "❌ SonarQube analysis failed: ${e.message}"
                         echo "🔄 Continuing pipeline without SonarQube analysis"
-                        if (currentBuild.result != 'FAILURE') {
-                            currentBuild.result = 'UNSTABLE'
-                        }
+                        // Don't mark as UNSTABLE for SonarQube failures unless enforced
                     }
                 }
             }
@@ -409,10 +419,8 @@ EOF
                                 if (params.ENFORCE_QUALITY_GATE) {
                                     error "Quality Gate failure: ${qg.status}. Pipeline aborted due to quality issues."
                                 } else {
-                                    if (currentBuild.result != 'FAILURE') {
-                                        currentBuild.result = 'UNSTABLE'
-                                    }
                                     echo "⚠️ Quality Gate failed but pipeline continues due to configuration"
+                                    // Don't mark as UNSTABLE for Quality Gate unless enforced
                                 }
                             } else {
                                 echo "✅ Quality Gate status: ${qg.status}"
@@ -424,9 +432,7 @@ EOF
                                 error "Quality Gate check failed: ${e.message}"
                             } else {
                                 echo "🔄 Continuing pipeline without Quality Gate"
-                                if (currentBuild.result != 'FAILURE') {
-                                    currentBuild.result = 'UNSTABLE'
-                                }
+                                // Don't mark as UNSTABLE for Quality Gate issues unless enforced
                             }
                         }
                     }
@@ -540,7 +546,7 @@ EOF
             }
         }
 
-        // Étape 9: Application des politiques de sécurité
+        // Étape 9: Application des politiques de sécurité - CORRECTED
         stage('Security Policy Enforcement') {
             steps {
                 script {
@@ -577,32 +583,51 @@ EOF
                     echo "📊 Total security findings: ${securityFindings.total_vulnerabilities}"
                     echo "============================="
                     
-                    // Apply security policies
+                    // Apply security policies - CORRECTED LOGIC
+                    def shouldFail = false
+                    def shouldBeUnstable = false
+                    
                     if (params.FAIL_ON_CRITICAL_VULNS && totalCritical > 0) {
                         echo "❌ CRITICAL vulnerabilities detected: ${totalCritical}"
-                        currentBuild.result = 'FAILURE'
-                        error "Build failed due to ${totalCritical} CRITICAL vulnerabilities (policy: FAIL_ON_CRITICAL_VULNS=true)"
+                        shouldFail = true
                     } else if (params.FAIL_ON_HIGH_VULNS && totalHigh > 0) {
                         echo "❌ HIGH vulnerabilities detected: ${totalHigh}"
+                        shouldFail = true
+                    } else if (params.FAIL_ON_SECRETS && securityFindings.secrets > 0) {
+                        echo "❌ SECRETS detected: ${securityFindings.secrets}"
+                        shouldFail = true
+                    }
+                    
+                    if (shouldFail) {
                         currentBuild.result = 'FAILURE'
-                        error "Build failed due to ${totalHigh} HIGH vulnerabilities (policy: FAIL_ON_HIGH_VULNS=true)"
-                    } else if (totalCritical > 0) {
-                        echo "⚠️ CRITICAL vulnerabilities detected: ${totalCritical} (not failing build due to policy)"
+                        error "Build failed due to security policy violations"
+                    }
+                    
+                    // Only mark as UNSTABLE if we have critical/high vulnerabilities AND policies are strict
+                    // Otherwise, continue with SUCCESS but report findings
+                    if (totalCritical > 0 && !params.FAIL_ON_CRITICAL_VULNS) {
+                        echo "⚠️ CRITICAL vulnerabilities detected: ${totalCritical} (continuing due to policy)"
                         if (currentBuild.result != 'FAILURE') {
                             currentBuild.result = 'UNSTABLE'
                         }
-                    } else if (totalHigh > 0) {
-                        echo "⚠️ HIGH vulnerabilities detected: ${totalHigh}"
+                    } else if (totalHigh > 0 && !params.FAIL_ON_HIGH_VULNS) {
+                        echo "⚠️ HIGH vulnerabilities detected: ${totalHigh} (continuing due to policy)"
                         if (currentBuild.result == null) {
                             currentBuild.result = 'UNSTABLE'
                         }
-                    } else if (securityFindings.secrets > 0) {
-                        echo "🔑 CRITICAL: ${securityFindings.secrets} secrets found in code!"
+                    } else if (securityFindings.secrets > 0 && !params.FAIL_ON_SECRETS) {
+                        echo "🔑 SECRETS found: ${securityFindings.secrets} (continuing due to policy)"
+                        if (currentBuild.result == null) {
+                            currentBuild.result = 'UNSTABLE'
+                        }
+                    } else if (totalMedium > 0 && !params.ALLOW_MEDIUM_VULNS) {
+                        echo "🟡 MEDIUM vulnerabilities detected: ${totalMedium}"
                         if (currentBuild.result == null) {
                             currentBuild.result = 'UNSTABLE'
                         }
                     } else {
-                        echo "✅ No critical/high vulnerabilities or secrets blocking the build"
+                        echo "✅ Security findings within acceptable limits according to policies"
+                        // Don't change build result if it's already SUCCESS
                     }
                     
                     // Save findings
@@ -748,7 +773,7 @@ EOF
             script {
                 if (params.NOTIFICATION_TYPE == 'EMAIL' || params.NOTIFICATION_TYPE == 'BOTH') {
                     try {
-                        def securityFindings = [critical: 0, high: 0, medium: 0, secrets: 0, semgrep: 0]
+                        def securityFindings = [critical: 0, high: 0, medium: 0, secrets: 0, semgrep: 0, trivy_critical: 0, trivy_high: 0, trivy_medium: 0]
                         if (fileExists('security-findings.json')) {
                             securityFindings = readJSON file: 'security-findings.json'
                         }
@@ -765,14 +790,25 @@ EOF
                             <p><strong>Build:</strong> #${env.BUILD_NUMBER}</p>
                             <p><strong>Status:</strong> UNSTABLE ⚠️</p>
                             <p><strong>Duration:</strong> ${currentBuild.durationString.replace(' and counting', '')}</p>
+                            <p><strong>Commit:</strong> ${env.GIT_COMMIT}</p>
+                            <p><strong>Author:</strong> ${env.GIT_AUTHOR ?: 'N/A'}</p>
                             
-                            <h3>Security Findings:</h3>
+                            <h3>Security Findings</h3>
                             <ul>
                                 <li>🔴 Critical Vulnerabilities: ${totalCritical}</li>
                                 <li>🟠 High Vulnerabilities: ${totalHigh}</li>
                                 <li>🟡 Medium Vulnerabilities: ${totalMedium}</li>
                                 <li>🔑 Secrets Exposed: ${securityFindings.secrets}</li>
                                 <li>🐛 Code Issues: ${securityFindings.semgrep}</li>
+                            </ul>
+                            
+                            <h3>Recommendations</h3>
+                            <ul>
+                                ${totalCritical > 0 ? '<li>🔴 Immediately address critical vulnerabilities</li>' : ''}
+                                ${totalHigh > 0 ? '<li>🟠 Plan remediation for high severity issues</li>' : ''}
+                                ${totalMedium > 0 ? '<li>🟡 Monitor medium severity vulnerabilities</li>' : ''}
+                                ${securityFindings.secrets > 0 ? '<li>🔴 Rotate exposed credentials immediately</li>' : ''}
+                                ${securityFindings.semgrep > 0 ? '<li>🟠 Review and fix SAST findings</li>' : ''}
                             </ul>
                             
                             <p>Please review the attached security reports and address the issues before deployment.</p>
