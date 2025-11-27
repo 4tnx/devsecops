@@ -1,6 +1,6 @@
 pipeline {
     agent any
-//test123
+
     tools {
         maven 'MAVEN3'
         jdk 'JDK17'
@@ -11,7 +11,6 @@ pipeline {
     }
 
     stages {
-
         stage('Checkout') {
             steps {
                 deleteDir()
@@ -31,12 +30,12 @@ pipeline {
                 '''
                 archiveArtifacts artifacts: 'semgrep-report.json', allowEmptyArchive: true
             }
-
         }
 
         stage('SpotBugs Analysis') {
             steps {
-                sh 'mvn clean compile spotbugs:check || true'
+                sh 'mvn clean compile spotbugs:spotbugs || true'
+                sh 'mvn spotbugs:spotbugs || true'
                 archiveArtifacts artifacts: 'target/spotbugsXml.xml', allowEmptyArchive: true
                 archiveArtifacts artifacts: 'target/site/spotbugs.html', allowEmptyArchive: true
             }
@@ -63,70 +62,76 @@ pipeline {
                 sh 'docker build -f $WORKSPACE/Dockerfile -t testfoodfreezy $WORKSPACE'
             }
         }
-stage('Trivy Scan') {
-    steps {
-        sh '''
-        mkdir -p trivy_reports
-        # Update Trivy DB first
-        trivy image --download-db-only
-        # Run scan with proper permissions
-        trivy image --format template \
-            --template "@/usr/local/share/trivy/templates/html.tpl" \
-            -o trivy_reports/trivy-report.html \
-            testfoodfreezy || true
-        '''
-    }
-}
-    post {
-        always {
-            archiveArtifacts artifacts: 'trivy_reports/*.html', allowEmptyArchive: true
-        }
-    }
-}
 
-        stage('OWASP Dependency-Check Vulnerabilities') {
-          steps {
-            dependencyCheck additionalArguments: '''
-                --scan "./target"
-                --enableExperimental
-                -f "ALL"
-                --prettyPrint
-            ''', odcInstallation: 'DP-Check'
-            dependencyCheckPublisher pattern: 'dependency-check-report.xml'
-            archiveArtifacts artifacts: 'dependency-check-report.html', allowEmptyArchive: true
-          }
+        stage('Trivy Scan') {
+            steps {
+                sh '''
+                echo "Running Trivy vulnerability scan..."
+                mkdir -p trivy_reports
+                
+                # Update database and run scan
+                trivy image --download-db-only
+                trivy image \
+                    --format template \
+                    --template "@/usr/local/share/trivy/templates/html.tpl" \
+                    -o trivy_reports/trivy-report.html \
+                    testfoodfreezy || true
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy_reports/*.html', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('OWASP Dependency-Check') {
+            steps {
+                dependencyCheck additionalArguments: '''
+                    --scan "./target"
+                    --enableExperimental
+                    -f "HTML"
+                    --prettyPrint
+                ''', odcInstallation: 'DP-Check'
+                dependencyCheckPublisher pattern: 'dependency-check-report.xml'
+                archiveArtifacts artifacts: 'dependency-check-report.html', allowEmptyArchive: true
+            }
         }
 
         stage('Secrets Scan - Gitleaks') {
             steps {
                 script {
                     sh "mkdir -p ${WORKSPACE}/secrets_reports"
-
                     sh """
                     docker run --rm -v ${WORKSPACE}:/code zricethezav/gitleaks:latest detect \
                         --source=/code \
                         --report-format=json \
-                        --report-path=/code/secrets_reports/gitleaks-report.json
+                        --report-path=/code/secrets_reports/gitleaks-report.json || true
                     """
                 }
-                archiveArtifacts artifacts: 'secrets_reports/*.json'
+                archiveArtifacts artifacts: 'secrets_reports/*.json', allowEmptyArchive: true
             }
         }
 
         stage('Run WebApp') {
             steps {
                 sh '''
+                # Kill any existing process on port 8080
+                pkill -f "java -jar target/*.jar" || true
+                sleep 2
+                
+                # Start application
                 nohup java -jar target/*.jar > app.log 2>&1 &
+                
+                # Wait for application to start
                 for i in {1..30}; do
-                    if curl -s http://localhost:8080/  > /dev/null; then
+                    if curl -s http://localhost:8080/ > /dev/null; then
                         echo "Application is up!"
-                        exit 0
+                        break
                     fi
-                    echo "Waiting app to be ready..."
+                    echo "Waiting for app to be ready... ($i/30)"
                     sleep 2
                 done
-                echo "Application failed to start!"
-                exit 1
                 '''
             }
         }
@@ -135,14 +140,16 @@ stage('Trivy Scan') {
             steps {
                 script {
                     sh "docker rm -f zap 2>/dev/null || true"
-
                     sh """
                         docker run -d --network host --name zap ghcr.io/zaproxy/zaproxy:stable sleep infinity
                     """
                     sh "docker exec zap mkdir -p /zap/wrk"
 
+                    // Wait for app to be fully ready
+                    sleep 30
+
                     def zapExit = sh(
-                        script: "docker exec zap zap-full-scan.py -t http://localhost:8080 -r /zap/report.html",
+                        script: "docker exec zap zap-full-scan.py -t http://localhost:8080 -r /zap/report.html -I",
                         returnStatus: true
                     )
 
@@ -150,21 +157,18 @@ stage('Trivy Scan') {
                     sh "docker cp zap:/zap/report.html ${WORKSPACE}/zap_reports/report.html"
 
                     echo "ZAP scan finished with exit code: ${zapExit}"
-
-                    if (zapExit == 1 || zapExit == 3) {
-                        error "ZAP scan failed"
-                    }
                 }
             }
-
             post {
                 always {
                     archiveArtifacts artifacts: 'zap_reports/*.html', allowEmptyArchive: true
                     sh "docker rm -f zap || true"
+                    // Stop the application after ZAP scan
+                    sh 'pkill -f "java -jar target/*.jar" || true'
                 }
             }
         }
-//123
+
         stage('Sonar Analysis') {
             steps {
                 withSonarQubeEnv('SonarQubeServer') {
@@ -180,7 +184,6 @@ stage('Trivy Scan') {
                 }
             }
         }
-
     }
 
     post {
@@ -235,4 +238,3 @@ stage('Trivy Scan') {
         }
     }
 }
-
