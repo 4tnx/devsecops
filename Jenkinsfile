@@ -63,25 +63,20 @@ pipeline {
                 sh 'docker build -f $WORKSPACE/Dockerfile -t testfoodfreezy $WORKSPACE'
             }
         }
-
-        stage('Trivy Scan') {
+stage('Trivy Scan') {
     steps {
         sh '''
-        echo "Running Trivy vulnerability scan (local installation)..."
-
-        # Create report directory
         mkdir -p trivy_reports
-
-        # Run Trivy image scan using local DB cache
-        trivy image \
-            --cache-dir /var/lib/trivy \
-            --skip-db-update \
-            --format template \
-            --template /usr/local/share/trivy/templates/html.tpl \
+        # Update Trivy DB first
+        trivy image --download-db-only
+        # Run scan with proper permissions
+        trivy image --format template \
+            --template "@/usr/local/share/trivy/templates/html.tpl" \
             -o trivy_reports/trivy-report.html \
             testfoodfreezy || true
         '''
     }
+}
     post {
         always {
             archiveArtifacts artifacts: 'trivy_reports/*.html', allowEmptyArchive: true

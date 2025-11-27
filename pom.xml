@@ -60,6 +60,7 @@
             <artifactId>hibernate-validator</artifactId>
             <version>${hibernate-validator.version}</version>
         </dependency>
+        
         <dependency>
             <groupId>org.hibernate.orm</groupId>
             <artifactId>hibernate-core</artifactId>
@@ -253,6 +254,11 @@
 
 
     <build>
+    <plugin>
+    <groupId>com.github.spotbugs</groupId>
+    <artifactId>spotbugs-maven-plugin</artifactId>
+    <version>4.8.2</version>
+</plugin>
         <plugins>
             <!-- Jetty Plugin -->
             <plugin>
