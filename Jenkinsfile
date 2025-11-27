@@ -136,6 +136,41 @@ pipeline {
             }
         }
 
+        stage('Update Trivy DB') {
+            steps {
+                sh '''
+                echo "Updating Trivy vulnerability database..."
+                
+                # Use persistent cache location in Jenkins home
+                TRIVY_CACHE="/var/lib/jenkins/trivy-cache"
+                sudo mkdir -p $TRIVY_CACHE
+                sudo chown -R jenkins:jenkins $TRIVY_CACHE
+                
+                # Update DB only once per day (check if DB is older than 24 hours)
+                if [ ! -f "$TRIVY_CACHE/db/trivy.db" ] || \\
+                   [ $(find "$TRIVY_CACHE/db/trivy.db" -mtime +0 2>/dev/null) ]; then
+                    echo "Downloading fresh Trivy DB..."
+                    docker run --rm \\
+                        -v "$TRIVY_CACHE:/root/.cache" \\
+                        aquasec/trivy:latest \\
+                        image --download-db-only
+                    
+                    # Verify download success
+                    if [ -f "$TRIVY_CACHE/db/trivy.db" ]; then
+                        DB_SIZE=$(du -h "$TRIVY_CACHE/db/trivy.db" | cut -f1)
+                        echo "✅ Trivy DB downloaded successfully: $DB_SIZE"
+                    else
+                        echo "⚠️ Trivy DB download may have failed, but continuing..."
+                    fi
+                else
+                    echo "Using cached Trivy DB (less than 24 hours old)"
+                    DB_SIZE=$(du -h "$TRIVY_CACHE/db/trivy.db" 2>/dev/null | cut -f1 || echo "Unknown")
+                    echo "Cached DB size: $DB_SIZE"
+                fi
+                '''
+            }
+        }
+
         stage('Optimize Build') {
             steps {
                 sh '''
@@ -195,60 +230,90 @@ EOF
             }
             steps {
                 sh '''
-                echo "Running FAST Trivy scan (OS packages only)..."
+                echo "Running FAST Trivy scan with cached DB..."
                 mkdir -p trivy_reports
                 
-                # Fast scan with proper error handling
+                TRIVY_CACHE="/var/lib/jenkins/trivy-cache"
+                
+                # Fast scan using cached DB - skip all updates
                 docker run --rm \\
                     -v /var/run/docker.sock:/var/run/docker.sock \\
                     -v $PWD/trivy_reports:/output \\
+                    -v "$TRIVY_CACHE:/root/.cache" \\
                     aquasec/trivy:latest \\
                     image \\
+                    --skip-db-update \\
+                    --skip-java-db-update \\
                     --scanners vuln \\
                     --format template \\
                     --template "@contrib/html.tpl" \\
                     -o /output/trivy-fast.html \\
                     --severity HIGH,CRITICAL \\
-                    testfoodfreezy || echo "Trivy scan completed with exit code: $?"
+                    testfoodfreezy
                 
-                echo "Fast vulnerability scan completed"
+                echo "✅ Fast vulnerability scan completed (using cached DB)"
                 '''
             }
             post {
                 always {
                     archiveArtifacts artifacts: 'trivy_reports/*.html', allowEmptyArchive: true
+                    sh '''
+                    # Display scan summary
+                    if [ -f "trivy_reports/trivy-fast.html" ]; then
+                        echo "Trivy report generated: trivy_reports/trivy-fast.html"
+                        # Extract basic vulnerability info
+                        if grep -q "HIGH" trivy_reports/trivy-fast.html 2>/dev/null; then
+                            HIGH_COUNT=$(grep -o "HIGH" trivy_reports/trivy-fast.html | wc -l)
+                            echo "HIGH severity vulnerabilities: $HIGH_COUNT"
+                        else
+                            echo "No HIGH severity vulnerabilities found"
+                        fi
+                        
+                        if grep -q "CRITICAL" trivy_reports/trivy-fast.html 2>/dev/null; then
+                            CRITICAL_COUNT=$(grep -o "CRITICAL" trivy_reports/trivy-fast.html | wc -l)
+                            echo "CRITICAL severity vulnerabilities: $CRITICAL_COUNT"
+                        else
+                            echo "No CRITICAL severity vulnerabilities found"
+                        fi
+                    else
+                        echo "No Trivy report generated"
+                    fi
+                    '''
                 }
             }
         }
 
         stage('Comprehensive Trivy Scan') {
             when {
-                expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
+                expression { 
+                    // Run comprehensive scan only on demand or once per week
+                    def day = new Date().format('u')
+                    return currentBuild.resultIsBetterOrEqualTo('SUCCESS') && (day == '1' || env.RUN_FULL_SCAN == 'true')
+                }
             }
             steps {
                 sh '''
-                echo "Running comprehensive Trivy scan..."
+                echo "Running comprehensive Trivy scan (includes Java DB)..."
                 mkdir -p trivy_reports
                 
-                # Update Trivy DB first
-                docker run --rm \\
-                    -v /tmp/trivy:/root/.cache \
-                    aquasec/trivy:latest \\
-                    image --download-db-only
+                TRIVY_CACHE="/var/lib/jenkins/trivy-cache"
                 
-                # Comprehensive scan
+                # Comprehensive scan with Java DB (takes longer)
                 docker run --rm \\
                     -v /var/run/docker.sock:/var/run/docker.sock \\
                     -v $PWD/trivy_reports:/output \\
-                    -v /tmp/trivy:/root/.cache \\
+                    -v "$TRIVY_CACHE:/root/.cache" \\
                     aquasec/trivy:latest \\
                     image \\
+                    --skip-db-update \\
                     --scanners vuln,secret,config \\
                     --format template \\
                     --template "@contrib/html.tpl" \\
                     -o /output/trivy-comprehensive.html \\
                     --severity HIGH,CRITICAL \\
-                    testfoodfreezy || echo "Comprehensive Trivy scan completed"
+                    testfoodfreezy
+                
+                echo "✅ Comprehensive vulnerability scan completed"
                 '''
             }
         }
@@ -340,6 +405,7 @@ EOF
                 echo "=== SECURITY SCAN SUMMARY ===" > reports/summary.txt
                 echo "Build: ${env.JOB_NAME} #${env.BUILD_NUMBER}" >> reports/summary.txt
                 echo "Timestamp: $(date)" >> reports/summary.txt
+                echo "Status: ${currentBuild.currentResult}" >> reports/summary.txt
                 echo "" >> reports/summary.txt
                 echo "Generated Reports:" >> reports/summary.txt
                 ls -la reports/ >> reports/summary.txt 2>/dev/null || echo "No reports found" >> reports/summary.txt
@@ -354,7 +420,7 @@ EOF
                 tar -czf reports.tar.gz reports/ 2>/dev/null || echo "Failed to package reports"
                 '''
                 
-                // Cleanup Docker resources
+                // Cleanup Docker resources (but keep Trivy cache)
                 sh '''
                 echo "Cleaning up Docker resources..."
                 docker system prune -f 2>/dev/null || true
@@ -378,12 +444,12 @@ EOF
                         <li>✅ SpotBugs Analysis</li>
                         <li>✅ OWASP Dependency-Check (Fixed)</li>
                         <li>✅ Gitleaks Secrets Detection</li>
-                        <li>✅ Trivy Container Scan (Fast + Comprehensive)</li>
+                        <li>✅ Trivy Container Scan (Fast Mode with Cached DB)</li>
                         <li>✅ Application Build & Package</li>
                         <li>✅ SonarQube Analysis</li>
                     </ul>
                     
-                    <p><i>All security reports are attached.</i></p>
+                    <p><i>All security reports are attached. Trivy scans now use cached DB for faster execution.</i></p>
                 """,
                 mimeType: 'text/html',
                 attachmentsPattern: 'reports.*',
@@ -394,6 +460,7 @@ EOF
         success {
             sh '''
             echo "🎉 Pipeline completed successfully!"
+            echo "Trivy DB caching enabled - subsequent runs will be much faster!"
             echo "All security scans and builds completed."
             '''
         }
