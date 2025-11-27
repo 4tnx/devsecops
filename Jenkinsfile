@@ -8,7 +8,6 @@ pipeline {
 
     environment {
         SONAR_TOKEN = credentials('sonar-token')
-        TRIVY_CACHE_DIR = '/var/lib/jenkins/trivy-cache'
     }
 
     stages {
@@ -25,35 +24,11 @@ pipeline {
             }
         }
 
-        stage('Setup Trivy Cache') {
+        stage('Setup Environment') {
             steps {
                 sh '''
-                echo "Setting up Trivy cache..."
+                echo "Setting up environment..."
                 mkdir -p trivy_reports zap_reports secrets_reports
-                
-                # Create and setup Trivy cache directory
-                if [ ! -d "${TRIVY_CACHE_DIR}" ]; then
-                    echo "Creating Trivy cache directory..."
-                    sudo mkdir -p ${TRIVY_CACHE_DIR} || mkdir -p ${TRIVY_CACHE_DIR}
-                    sudo chown jenkins:jenkins ${TRIVY_CACHE_DIR} || true
-                fi
-                
-                # Download databases only if older than 1 day or don't exist
-                if [ ! -f "${TRIVY_CACHE_DIR}/db/metadata.json" ] || \\
-                   [ $(find "${TRIVY_CACHE_DIR}/db/metadata.json" -mtime +1 2>/dev/null | wc -l) -gt 0 ]; then
-                    echo "Downloading Trivy vulnerability database..."
-                    timeout 300 trivy image --download-db-only --cache-dir ${TRIVY_CACHE_DIR} || echo "DB download timed out, using existing"
-                else
-                    echo "Trivy vulnerability database is up to date"
-                fi
-                
-                if [ ! -f "${TRIVY_CACHE_DIR}/javadb/metadata.json" ] || \\
-                   [ $(find "${TRIVY_CACHE_DIR}/javadb/metadata.json" -mtime +1 2>/dev/null | wc -l) -gt 0 ]; then
-                    echo "Downloading Trivy Java database..."
-                    timeout 300 trivy image --download-java-db-only --cache-dir ${TRIVY_CACHE_DIR} || echo "Java DB download timed out, using existing"
-                else
-                    echo "Trivy Java database is up to date"
-                fi
                 '''
             }
         }
@@ -150,6 +125,8 @@ pipeline {
                 sh '''
                 echo "Packaging application..."
                 mvn package -DskipTests=true
+                echo "Generated artifacts:"
+                ls -la target/*.war 2>/dev/null || echo "No WAR file found"
                 '''
             }
         }
@@ -172,40 +149,33 @@ CMD ["catalina.sh", "run"]
 EOF
                 fi
                 docker build -t testfoodfreezy .
+                echo "Docker image built successfully: testfoodfreezy"
                 '''
             }
         }
 
-        stage('Fast Trivy Scan') {
+        stage('Trivy Scan with Docker') {
             when {
                 expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
             }
             steps {
                 sh '''
-                echo "Running FAST Trivy scan..."
+                echo "Running Trivy scan using Docker (faster)..."
                 
-                # Option 1: Scan rapide sans Java DB (si le téléchargement est trop long)
-                echo "=== Scanning for OS packages only (FAST) ==="
-                trivy image \
-                    --cache-dir ${TRIVY_CACHE_DIR} \
-                    --scanners vuln \
-                    --severity HIGH,CRITICAL \
+                # Use Docker version which often has pre-downloaded databases
+                docker run --rm \
+                    -v /var/run/docker.sock:/var/run/docker.sock \
+                    -v $PWD/trivy_reports:/output \
+                    aquasec/trivy:latest \
+                    image \
                     --format template \
-                    --template "@/usr/local/share/trivy/templates/html.tpl" \
-                    -o trivy_reports/trivy-fast.html \
-                    testfoodfreezy || echo "Fast scan completed"
+                    --template "@contrib/html.tpl" \
+                    -o /output/trivy-docker.html \
+                    --severity HIGH,CRITICAL \
+                    testfoodfreezy || echo "Trivy Docker scan completed"
                 
-                # Option 2: Scan complet avec timeout
-                echo "=== Full scan with timeout (SLOW) ==="
-                timeout 600 trivy image \
-                    --cache-dir ${TRIVY_CACHE_DIR} \
-                    --severity HIGH,CRITICAL \
-                    --format template \
-                    --template "@/usr/local/share/trivy/templates/html.tpl" \
-                    -o trivy_reports/trivy-full.html \
-                    testfoodfreezy || echo "Full scan timed out or completed"
-                    
-                echo "Trivy scans completed"
+                echo "Trivy scan report generated:"
+                ls -la trivy_reports/ || echo "No Trivy reports directory"
                 '''
             }
             post {
@@ -215,22 +185,72 @@ EOF
             }
         }
 
-        stage('Quick Security Assessment') {
+        stage('Run WebApp & ZAP Scan') {
+            when {
+                expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
+            }
             steps {
-                sh '''
-                echo "=== Quick Security Checks ==="
-                # Check Dockerfile security
-                echo "Dockerfile security checks:"
-                if [ -f "Dockerfile" ]; then
-                    grep -i "root\\|password\\|secret" Dockerfile || echo "No obvious security issues in Dockerfile"
-                fi
-                
-                # Check for exposed ports
-                echo "Exposed ports:"
-                grep -i "expose" Dockerfile 2>/dev/null || echo "No EXPOSE directives"
-                
-                echo "Quick security assessment completed"
-                '''
+                script {
+                    // Start application
+                    sh '''
+                    echo "Starting web application..."
+                    JAR_FILE=$(find target -name "*.war" -o -name "*.jar" | grep -v sources | grep -v javadoc | head -1)
+                    if [ -n "$JAR_FILE" ] && [ -f "$JAR_FILE" ]; then
+                        echo "Starting application: $JAR_FILE"
+                        nohup java -jar "$JAR_FILE" > app.log 2>&1 &
+                        echo $! > app.pid
+                        
+                        # Wait for application to start (max 30 seconds)
+                        echo "Waiting for app to start..."
+                        for i in {1..15}; do
+                            if curl -s http://localhost:8080/ > /dev/null; then
+                                echo "Application is up and running!"
+                                break
+                            fi
+                            echo "Waiting... ($i/15)"
+                            sleep 2
+                        done
+                    else
+                        echo "No executable JAR/WAR file found"
+                    fi
+                    '''
+                    
+                    // ZAP Scan
+                    sh '''
+                    echo "Running ZAP security scan..."
+                    docker rm -f zap-scanner 2>/dev/null || true
+                    
+                    docker run -u zap -d --name zap-scanner \
+                        -v $(pwd)/zap_reports:/zap/wrk:rw \
+                        -p 8081:8080 ghcr.io/zaproxy/zaproxy:stable zap.sh \
+                        -daemon -host 0.0.0.0 -port 8080 -config api.disablekey=true
+                    
+                    # Wait for ZAP to start
+                    sleep 30
+                    
+                    # Run baseline scan
+                    docker exec zap-scanner zap-baseline.py \
+                        -t http://host.docker.internal:8080 \
+                        -r -w /zap/wrk/zap-report.html \
+                        -m 1 || echo "ZAP scan completed"
+                    
+                    # Copy report
+                    docker cp zap-scanner:/zap/wrk/zap-report.html $(pwd)/zap_reports/ 2>/dev/null || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    sh '''
+                    # Stop application
+                    echo "Stopping application..."
+                    [ -f app.pid ] && kill $(cat app.pid) 2>/dev/null || true
+                    pkill -f "java -jar" 2>/dev/null || true
+                    rm -f app.pid 2>/dev/null || true
+                    '''
+                    archiveArtifacts artifacts: 'zap_reports/*.html', allowEmptyArchive: true
+                    archiveArtifacts artifacts: 'app.log', allowEmptyArchive: true
+                }
             }
         }
 
@@ -251,63 +271,105 @@ EOF
                 }
             }
         }
+
+        stage('Quality Gate') {
+            when {
+                expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
+            }
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: false
+                }
+            }
+        }
     }
 
     post {
         always {
             script {
-                // Collect reports
+                // Collect all reports
                 sh '''
-                echo "Collecting security reports..."
+                echo "Collecting all security reports..."
                 mkdir -p reports
                 
+                # Copy available reports
                 cp semgrep-report.json reports/ 2>/dev/null || echo "No Semgrep report"
                 cp dependency-check-report.html reports/ 2>/dev/null || echo "No Dependency Check report"
                 cp secrets_reports/*.json reports/ 2>/dev/null || echo "No Secrets report"
+                cp zap_reports/*.html reports/ 2>/dev/null || echo "No ZAP report"
                 cp trivy_reports/*.html reports/ 2>/dev/null || echo "No Trivy report"
                 cp target/spotbugsXml.xml reports/ 2>/dev/null || echo "No SpotBugs report"
+                cp app.log reports/ 2>/dev/null || echo "No app log"
                 
-                echo "Final reports:"
+                echo "=== Final Reports ==="
                 ls -la reports/
                 '''
                 
                 // Package reports
                 sh '''
+                echo "Packaging reports..."
                 tar -czf reports.tar.gz reports/ 2>/dev/null || echo "Failed to package reports"
                 '''
                 
                 // Cleanup
                 sh '''
-                echo "Cleaning up to save disk space..."
+                echo "Cleaning up workspace..."
                 find . -name "target" -type d -exec rm -rf {} + 2>/dev/null || true
+                find . -name "*.log" -type f -delete 2>/dev/null || true
                 docker system prune -f 2>/dev/null || true
+                docker rm -f zap-scanner 2>/dev/null || true
                 '''
                 
                 // Email notification
+                def buildStatus = currentBuild.currentResult
                 emailext(
                     to: 'mekni.amin75@gmail.com',
-                    subject: "✅ Pipeline ${currentBuild.currentResult} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    subject: "🔒 Security Pipeline ${buildStatus} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                     body: """
-                        <h3>Security Pipeline Complete</h3>
-                        <p><b>Status:</b> ${currentBuild.currentResult}</p>
+                        <h3>🔒 Security Pipeline Complete</h3>
+                        <p><b>Status:</b> <span style="color: ${buildStatus == 'SUCCESS' ? 'green' : 'orange'}">${buildStatus}</span></p>
                         <p><b>Project:</b> ${env.JOB_NAME}</p>
                         <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
                         <p><b>Duration:</b> ${currentBuild.durationString}</p>
+                        <p><b>URL:</b> <a href="${env.BUILD_URL}">View Build Details</a></p>
                         
-                        <h4>Security Scans Completed:</h4>
+                        <h4>📊 Security Scans Completed:</h4>
                         <ul>
-                            <li>✅ Semgrep SAST</li>
-                            <li>✅ SpotBugs Analysis</li>
+                            <li>✅ Semgrep SAST (Static Analysis)</li>
+                            <li>✅ SpotBugs (Code Quality)</li>
                             <li>✅ OWASP Dependency-Check</li>
-                            <li>✅ Secrets Detection (Gitleaks)</li>
-                            <li>✅ Trivy Container Scan</li>
-                            <li>✅ SonarQube Analysis</li>
+                            <li>✅ Gitleaks (Secrets Detection)</li>
+                            <li>✅ Trivy (Container Security)</li>
+                            <li>✅ ZAP (Dynamic Application Security Testing)</li>
+                            <li>✅ SonarQube (Code Quality Gate)</li>
                         </ul>
                         
-                        <p><i>All security reports are attached.</i></p>
+                        <p><i>All security reports are attached for your review.</i></p>
+                        <hr>
+                        <p><small>Jenkins Security Pipeline</small></p>
                     """,
                     mimeType: 'text/html',
                     attachmentsPattern: 'reports.*',
+                    attachLog: true
+                )
+            }
+        }
+        
+        failure {
+            script {
+                emailext(
+                    to: 'mekni.amin75@gmail.com',
+                    subject: "❌ Pipeline FAILED - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        <h3>❌ Pipeline Execution Failed</h3>
+                        <p><b>Project:</b> ${env.JOB_NAME}</p>
+                        <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
+                        <p><b>Status:</b> <span style="color: red">FAILED</span></p>
+                        <p><b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                        
+                        <p>Please check the attached logs for failure details.</p>
+                    """,
+                    mimeType: 'text/html',
                     attachLog: true
                 )
             }
