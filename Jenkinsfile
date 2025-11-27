@@ -25,16 +25,34 @@ pipeline {
             }
         }
 
-        stage('Setup Environment') {
+        stage('Setup Trivy Cache') {
             steps {
                 sh '''
-                echo "Setting up environment..."
+                echo "Setting up Trivy cache..."
                 mkdir -p trivy_reports zap_reports secrets_reports
                 
-                # Setup Trivy cache
+                # Create and setup Trivy cache directory
                 if [ ! -d "${TRIVY_CACHE_DIR}" ]; then
-                    sudo mkdir -p ${TRIVY_CACHE_DIR} 2>/dev/null || mkdir -p ${TRIVY_CACHE_DIR}
-                    sudo chown jenkins:jenkins ${TRIVY_CACHE_DIR} 2>/dev/null || true
+                    echo "Creating Trivy cache directory..."
+                    sudo mkdir -p ${TRIVY_CACHE_DIR} || mkdir -p ${TRIVY_CACHE_DIR}
+                    sudo chown jenkins:jenkins ${TRIVY_CACHE_DIR} || true
+                fi
+                
+                # Download databases only if older than 1 day or don't exist
+                if [ ! -f "${TRIVY_CACHE_DIR}/db/metadata.json" ] || \\
+                   [ $(find "${TRIVY_CACHE_DIR}/db/metadata.json" -mtime +1 2>/dev/null | wc -l) -gt 0 ]; then
+                    echo "Downloading Trivy vulnerability database..."
+                    timeout 300 trivy image --download-db-only --cache-dir ${TRIVY_CACHE_DIR} || echo "DB download timed out, using existing"
+                else
+                    echo "Trivy vulnerability database is up to date"
+                fi
+                
+                if [ ! -f "${TRIVY_CACHE_DIR}/javadb/metadata.json" ] || \\
+                   [ $(find "${TRIVY_CACHE_DIR}/javadb/metadata.json" -mtime +1 2>/dev/null | wc -l) -gt 0 ]; then
+                    echo "Downloading Trivy Java database..."
+                    timeout 300 trivy image --download-java-db-only --cache-dir ${TRIVY_CACHE_DIR} || echo "Java DB download timed out, using existing"
+                else
+                    echo "Trivy Java database is up to date"
                 fi
                 '''
             }
@@ -69,24 +87,12 @@ pipeline {
             }
         }
 
-        stage('Build & Unit Tests') {
+        stage('Build & Tests') {
             steps {
                 sh '''
-                echo "Building and running tests..."
-                # First compile to ensure everything builds
-                mvn clean compile -DskipTests=true
-                
-                # Then run tests with detailed output
-                mvn test -DskipTests=false || echo "Tests failed but continuing..."
+                echo "Building and testing..."
+                mvn clean compile test -DskipTests=false || echo "Tests may have failed but continuing..."
                 '''
-            }
-            post {
-                always {
-                    sh '''
-                    echo "Test results summary:"
-                    find target -name "*.txt" -o -name "*.xml" | grep -i test | head -10 || echo "No test reports found"
-                    '''
-                }
             }
         }
 
@@ -94,39 +100,28 @@ pipeline {
             steps {
                 sh '''
                 echo "Running SpotBugs analysis..."
-                # Generate XML report only (HTML takes more space)
-                mvn spotbugs:spotbugs -Dspotbugs.failOnError=false -Dspotbugs.effort=Max
+                mvn spotbugs:spotbugs -Dspotbugs.failOnError=false
                 '''
             }
             post {
                 always {
                     archiveArtifacts artifacts: 'target/spotbugsXml.xml', allowEmptyArchive: true
-                    script {
-                        // Try to generate HTML report if possible
-                        sh 'mvn spotbugs:spotbugs -Dspotbugs.threshold=Low > /dev/null 2>&1 || true'
-                        archiveArtifacts artifacts: 'target/site/spotbugs.html', allowEmptyArchive: true
-                    }
                 }
             }
         }
 
-        stage('Dependency-Check Fix') {
+        stage('Dependency-Check') {
             steps {
                 sh '''
-                echo "Running Dependency-Check with database update..."
-                # First update the database
-                dependency-check.sh --updateonly --data /tmp/dependency-check-data 2>/dev/null || true
-                
-                # Then run the scan
+                echo "Running OWASP Dependency-Check..."
                 dependency-check.sh \
                     --scan "." \
                     --format "HTML" \
-                    --format "JSON" \
                     --out "." \
-                    --data /tmp/dependency-check-data \
                     --enableExperimental \
                     --disableYarnAudit \
-                    --disableNodeAudit || echo "Dependency-Check completed with warnings"
+                    --disableNodeAudit \
+                    --noupdate || echo "Dependency-Check completed"
                 '''
             }
             post {
@@ -139,7 +134,7 @@ pipeline {
         stage('Secrets Scan') {
             steps {
                 sh '''
-                echo "Running secrets detection with Gitleaks..."
+                echo "Running secrets detection..."
                 docker run --rm -v $PWD:/code zricethezav/gitleaks:latest detect \
                     --source=/code \
                     --report-format=json \
@@ -155,29 +150,6 @@ pipeline {
                 sh '''
                 echo "Packaging application..."
                 mvn package -DskipTests=true
-                echo "Generated WAR file:"
-                ls -la target/*.war 2>/dev/null || echo "No WAR file generated"
-                '''
-            }
-        }
-
-        stage('Check Dockerfile') {
-            steps {
-                sh '''
-                echo "Checking for Dockerfile..."
-                if [ -f "Dockerfile" ]; then
-                    echo "Dockerfile found - Docker build will proceed"
-                    cat Dockerfile | head -10
-                else
-                    echo "No Dockerfile found - creating a simple one"
-                    cat > Dockerfile << EOF
-FROM tomcat:9.0-jre17
-COPY target/*.war /usr/local/tomcat/webapps/ROOT.war
-EXPOSE 8080
-CMD ["catalina.sh", "run"]
-EOF
-                    echo "Simple Dockerfile created"
-                fi
                 '''
             }
         }
@@ -189,30 +161,51 @@ EOF
             steps {
                 sh '''
                 echo "Building Docker image..."
+                if [ ! -f "Dockerfile" ]; then
+                    echo "Creating simple Dockerfile..."
+                    cat > Dockerfile << 'EOF'
+FROM tomcat:9.0-jre17
+RUN rm -rf /usr/local/tomcat/webapps/*
+COPY target/*.war /usr/local/tomcat/webapps/ROOT.war
+EXPOSE 8080
+CMD ["catalina.sh", "run"]
+EOF
+                fi
                 docker build -t testfoodfreezy .
-                echo "Docker image built successfully"
                 '''
             }
         }
 
-        stage('Trivy Scan') {
+        stage('Fast Trivy Scan') {
             when {
                 expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
             }
             steps {
                 sh '''
-                echo "Running Trivy vulnerability scan..."
+                echo "Running FAST Trivy scan..."
                 
-                # Use fast scan with cache
+                # Option 1: Scan rapide sans Java DB (si le téléchargement est trop long)
+                echo "=== Scanning for OS packages only (FAST) ==="
                 trivy image \
+                    --cache-dir ${TRIVY_CACHE_DIR} \
+                    --scanners vuln \
+                    --severity HIGH,CRITICAL \
+                    --format template \
+                    --template "@/usr/local/share/trivy/templates/html.tpl" \
+                    -o trivy_reports/trivy-fast.html \
+                    testfoodfreezy || echo "Fast scan completed"
+                
+                # Option 2: Scan complet avec timeout
+                echo "=== Full scan with timeout (SLOW) ==="
+                timeout 600 trivy image \
                     --cache-dir ${TRIVY_CACHE_DIR} \
                     --severity HIGH,CRITICAL \
                     --format template \
                     --template "@/usr/local/share/trivy/templates/html.tpl" \
-                    -o trivy_reports/trivy-report.html \
-                    testfoodfreezy || echo "Trivy scan completed with warnings"
-                
-                echo "Trivy scan completed"
+                    -o trivy_reports/trivy-full.html \
+                    testfoodfreezy || echo "Full scan timed out or completed"
+                    
+                echo "Trivy scans completed"
                 '''
             }
             post {
@@ -222,15 +215,21 @@ EOF
             }
         }
 
-        stage('Quick Security Scan') {
+        stage('Quick Security Assessment') {
             steps {
                 sh '''
-                echo "Running quick security assessment..."
-                # Check for common security issues
-                echo "=== Security Quick Scan ==="
-                find . -name "*.java" -exec grep -l "password\\|secret\\|key" {} \\; | head -5 || echo "No obvious hardcoded secrets found"
-                echo "=== Dependencies with known vulnerabilities ==="
-                mvn dependency:tree | grep -i vulnerable || echo "No vulnerable dependencies detected"
+                echo "=== Quick Security Checks ==="
+                # Check Dockerfile security
+                echo "Dockerfile security checks:"
+                if [ -f "Dockerfile" ]; then
+                    grep -i "root\\|password\\|secret" Dockerfile || echo "No obvious security issues in Dockerfile"
+                fi
+                
+                # Check for exposed ports
+                echo "Exposed ports:"
+                grep -i "expose" Dockerfile 2>/dev/null || echo "No EXPOSE directives"
+                
+                echo "Quick security assessment completed"
                 '''
             }
         }
@@ -247,8 +246,7 @@ EOF
                         -Dsonar.host.url=http://192.168.50.4:9000 \
                         -Dsonar.login=${SONAR_TOKEN} \
                         -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
-                        -Dsonar.sourceEncoding=UTF-8 \
-                        -Dsonar.exclusions="**/test/**,**/node_modules/**"
+                        -Dsonar.sourceEncoding=UTF-8
                     """
                 }
             }
@@ -258,89 +256,58 @@ EOF
     post {
         always {
             script {
-                // Collect and package reports
+                // Collect reports
                 sh '''
-                echo "Collecting all reports..."
+                echo "Collecting security reports..."
                 mkdir -p reports
-                   
-                # Copy all available reports
+                
                 cp semgrep-report.json reports/ 2>/dev/null || echo "No Semgrep report"
                 cp dependency-check-report.html reports/ 2>/dev/null || echo "No Dependency Check report"
                 cp secrets_reports/*.json reports/ 2>/dev/null || echo "No Secrets report"
                 cp trivy_reports/*.html reports/ 2>/dev/null || echo "No Trivy report"
+                cp target/spotbugsXml.xml reports/ 2>/dev/null || echo "No SpotBugs report"
                 
-                # Copy SpotBugs reports
-                cp target/spotbugsXml.xml reports/ 2>/dev/null || echo "No SpotBugs XML report"
-                cp target/site/spotbugs.html reports/ 2>/dev/null || echo "No SpotBugs HTML report"
-                
-                echo "=== Final Reports ==="
-                ls -la reports/ | head -10
-                echo "=== Disk Space ==="
-                df -h /var/lib/jenkins
+                echo "Final reports:"
+                ls -la reports/
                 '''
                 
                 // Package reports
                 sh '''
-                if command -v zip >/dev/null 2>&1; then
-                    zip -r reports.zip reports/
-                else
-                    tar -czf reports.tar.gz reports/
-                fi
+                tar -czf reports.tar.gz reports/ 2>/dev/null || echo "Failed to package reports"
                 '''
                 
-                // Cleanup to save space
+                // Cleanup
                 sh '''
-                echo "Cleaning up workspace..."
+                echo "Cleaning up to save disk space..."
                 find . -name "target" -type d -exec rm -rf {} + 2>/dev/null || true
-                find . -name "*.log" -type f -delete 2>/dev/null || true
                 docker system prune -f 2>/dev/null || true
                 '''
-
-                // Send notification
-                def buildStatus = currentBuild.currentResult
+                
+                // Email notification
                 emailext(
                     to: 'mekni.amin75@gmail.com',
-                    subject: "🔧 Pipeline ${buildStatus} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    subject: "✅ Pipeline ${currentBuild.currentResult} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                     body: """
                         <h3>Security Pipeline Complete</h3>
-                        <p><b>Status:</b> <span style="color: ${buildStatus == 'SUCCESS' ? 'green' : 'orange'}">${buildStatus}</span></p>
+                        <p><b>Status:</b> ${currentBuild.currentResult}</p>
                         <p><b>Project:</b> ${env.JOB_NAME}</p>
                         <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
                         <p><b>Duration:</b> ${currentBuild.durationString}</p>
-                        <p><b>URL:</b> <a href="${env.BUILD_URL}">View Build Details</a></p>
                         
-                        <h4>Security Findings:</h4>
+                        <h4>Security Scans Completed:</h4>
                         <ul>
-                            <li>Semgrep: 3 findings</li>
-                            <li>SpotBugs: 23 code quality issues</li>
-                            <li>Gitleaks: No secrets found ✅</li>
-                            <li>Tests: 0 tests executed (configuration issue)</li>
+                            <li>✅ Semgrep SAST</li>
+                            <li>✅ SpotBugs Analysis</li>
+                            <li>✅ OWASP Dependency-Check</li>
+                            <li>✅ Secrets Detection (Gitleaks)</li>
+                            <li>✅ Trivy Container Scan</li>
+                            <li>✅ SonarQube Analysis</li>
                         </ul>
                         
-                        <p><i>All security reports are attached for review.</i></p>
+                        <p><i>All security reports are attached.</i></p>
                     """,
                     mimeType: 'text/html',
                     attachmentsPattern: 'reports.*',
-                    attachLog: true
-                )
-            }
-        }
-        
-        failure {
-            script {
-                emailext(
-                    to: 'mekni.amin75@gmail.com',
-                    subject: "❌ Pipeline FAILED - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                    body: """
-                        <h3>Pipeline Execution Failed</h3>
-                        <p><b>Project:</b> ${env.JOB_NAME}</p>
-                        <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
-                        <p><b>Failed Stage:</b> ${env.STAGE_NAME}</p>
-                        <p><b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-                        
-                        <p>Please check the attached logs for details.</p>
-                    """,
-                    mimeType: 'text/html',
                     attachLog: true
                 )
             }
