@@ -21,6 +21,7 @@ pipeline {
         booleanParam(name: 'ALLOW_MEDIUM_VULNS', defaultValue: true, description: 'Allow medium vulnerabilities without marking UNSTABLE')
         booleanParam(name: 'ALLOW_SAST_FINDINGS', defaultValue: true, description: 'Allow SAST findings without marking UNSTABLE')
         booleanParam(name: 'FAIL_ON_SECRETS', defaultValue: false, description: 'Fail build when secrets are detected')
+        booleanParam(name: 'ALLOW_LOW_VULNERABILITIES', defaultValue: true, description: 'Allow vulnerabilities without marking UNSTABLE')
         booleanParam(name: 'RUN_DAST_SCAN', defaultValue: false, description: 'Perform DAST security testing')
         string(name: 'TEST_ENVIRONMENT_URL', defaultValue: 'http://localhost:8080', description: 'URL for DAST testing')
         choice(name: 'NOTIFICATION_TYPE', choices: ['SLACK', 'EMAIL', 'BOTH', 'NONE'], description: 'Select notification method')
@@ -183,6 +184,7 @@ EOF
                                                 if (params.FAIL_ON_SECRETS) {
                                                     if (currentBuild.result != 'FAILURE') {
                                                         currentBuild.result = 'UNSTABLE'
+                                                        echo "❌ Secrets marked build as UNSTABLE (FAIL_ON_SECRETS=true)"
                                                     }
                                                 } else {
                                                     echo "⚠️ Secrets found but continuing due to FAIL_ON_SECRETS=false"
@@ -587,14 +589,15 @@ EOF
                     def shouldFail = false
                     def shouldBeUnstable = false
                     
+                    // FAILURE conditions (strict policies)
                     if (params.FAIL_ON_CRITICAL_VULNS && totalCritical > 0) {
-                        echo "❌ CRITICAL vulnerabilities detected: ${totalCritical}"
+                        echo "❌ CRITICAL vulnerabilities detected: ${totalCritical} (FAIL_ON_CRITICAL_VULNS=true)"
                         shouldFail = true
                     } else if (params.FAIL_ON_HIGH_VULNS && totalHigh > 0) {
-                        echo "❌ HIGH vulnerabilities detected: ${totalHigh}"
+                        echo "❌ HIGH vulnerabilities detected: ${totalHigh} (FAIL_ON_HIGH_VULNS=true)"
                         shouldFail = true
                     } else if (params.FAIL_ON_SECRETS && securityFindings.secrets > 0) {
-                        echo "❌ SECRETS detected: ${securityFindings.secrets}"
+                        echo "❌ SECRETS detected: ${securityFindings.secrets} (FAIL_ON_SECRETS=true)"
                         shouldFail = true
                     }
                     
@@ -603,29 +606,47 @@ EOF
                         error "Build failed due to security policy violations"
                     }
                     
+                    // UNSTABLE conditions (warnings only)
                     // Only mark as UNSTABLE if we have critical/high vulnerabilities AND policies are strict
                     // Otherwise, continue with SUCCESS but report findings
-                    if (totalCritical > 0 && !params.FAIL_ON_CRITICAL_VULNS) {
-                        echo "⚠️ CRITICAL vulnerabilities detected: ${totalCritical} (continuing due to policy)"
+                    if (totalCritical > 0 && params.FAIL_ON_CRITICAL_VULNS) {
+                        echo "⚠️ CRITICAL vulnerabilities detected: ${totalCritical} (continuing with UNSTABLE due to policy)"
                         if (currentBuild.result != 'FAILURE') {
                             currentBuild.result = 'UNSTABLE'
                         }
-                    } else if (totalHigh > 0 && !params.FAIL_ON_HIGH_VULNS) {
-                        echo "⚠️ HIGH vulnerabilities detected: ${totalHigh} (continuing due to policy)"
+                    } else if (totalHigh > 0 && params.FAIL_ON_HIGH_VULNS) {
+                        echo "⚠️ HIGH vulnerabilities detected: ${totalHigh} (continuing with UNSTABLE due to policy)"
                         if (currentBuild.result == null) {
                             currentBuild.result = 'UNSTABLE'
                         }
-                    } else if (securityFindings.secrets > 0 && !params.FAIL_ON_SECRETS) {
-                        echo "🔑 SECRETS found: ${securityFindings.secrets} (continuing due to policy)"
+                    } else if (securityFindings.secrets > 0 && params.FAIL_ON_SECRETS) {
+                        echo "🔑 SECRETS found: ${securityFindings.secrets} (continuing with UNSTABLE due to policy)"
                         if (currentBuild.result == null) {
                             currentBuild.result = 'UNSTABLE'
                         }
                     } else if (totalMedium > 0 && !params.ALLOW_MEDIUM_VULNS) {
-                        echo "🟡 MEDIUM vulnerabilities detected: ${totalMedium}"
+                        echo "🟡 MEDIUM vulnerabilities detected: ${totalMedium} (continuing with UNSTABLE)"
                         if (currentBuild.result == null) {
                             currentBuild.result = 'UNSTABLE'
                         }
                     } else {
+                        // SUCCESS conditions - vulnerabilities are allowed by policy
+                        if (totalCritical > 0) {
+                            echo "🔴 CRITICAL vulnerabilities detected: ${totalCritical} (allowed by policy - FAIL_ON_CRITICAL_VULNS=false)"
+                        }
+                        if (totalHigh > 0) {
+                            echo "🟠 HIGH vulnerabilities detected: ${totalHigh} (allowed by policy - FAIL_ON_HIGH_VULNS=false)"
+                        }
+                        if (securityFindings.secrets > 0) {
+                            echo "🔑 SECRETS found: ${securityFindings.secrets} (allowed by policy - FAIL_ON_SECRETS=false)"
+                        }
+                        if (totalMedium > 0) {
+                            echo "🟡 MEDIUM vulnerabilities detected: ${totalMedium} (allowed by policy - ALLOW_MEDIUM_VULNS=true)"
+                        }
+                        if (securityFindings.semgrep > 0) {
+                            echo "🐛 SAST findings: ${securityFindings.semgrep} (allowed by policy - ALLOW_SAST_FINDINGS=true)"
+                        }
+                        
                         echo "✅ Security findings within acceptable limits according to policies"
                         // Don't change build result if it's already SUCCESS
                     }
