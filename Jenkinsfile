@@ -25,7 +25,7 @@ pipeline {
         booleanParam(name: 'RUN_DAST_SCAN', defaultValue: false, description: 'Perform DAST security testing')
         string(name: 'TEST_ENVIRONMENT_URL', defaultValue: 'http://localhost:8080', description: 'URL for DAST testing')
         choice(name: 'NOTIFICATION_TYPE', choices: ['SLACK', 'EMAIL', 'BOTH', 'NONE'], description: 'Select notification method')
-        string(name: 'EMAIL_RECIPIENTS', defaultValue: 'devops-team@company.com', description: 'Email recipients for notifications')
+        string(name: 'EMAIL_RECIPIENTS', defaultValue: 'mekni.amin75@gmail.com', description: 'Email recipients for notifications')
     }
 
     environment {
