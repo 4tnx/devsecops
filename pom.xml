@@ -319,23 +319,26 @@
         </plugin>
 
         <!-- SpotBugs Plugin -->
-        <plugin>
-            <groupId>com.github.spotbugs</groupId>
-            <artifactId>spotbugs-maven-plugin</artifactId>
-            <version>4.8.2.1</version>
-            <configuration>
-                <effort>Max</effort>
-                <threshold>Low</threshold>
-            </configuration>
-            <executions>
-                <execution>
-                    <phase>verify</phase>
-                    <goals>
-                        <goal>check</goal>
-                    </goals>
-                </execution>
-            </executions>
-        </plugin>
+        <!-- SpotBugs Plugin -->
+<plugin>
+    <groupId>com.github.spotbugs</groupId>
+    <artifactId>spotbugs-maven-plugin</artifactId>
+    <version>4.8.3.0</version>
+    <configuration>
+        <effort>Max</effort>
+        <threshold>Low</threshold>
+        <xmlOutput>true</xmlOutput>
+        <spotbugsXmlOutputDirectory>${project.build.directory}</spotbugsXmlOutputDirectory>
+    </configuration>
+    <executions>
+        <execution>
+            <phase>verify</phase>
+            <goals>
+                <goal>check</goal>
+            </goals>
+        </execution>
+    </executions>
+</plugin>
     </plugins>
 </build>
 </project>
