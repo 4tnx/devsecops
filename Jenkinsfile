@@ -25,7 +25,6 @@ pipeline {
     }
 
     environment {
-        SONAR_HOST_URL = 'http://192.168.50.4:9000'
         SCANNER_HOME = tool 'sonar-scanner'
         GIT_COMMIT = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
         BUILD_USER = sh(returnStdout: true, script: "whoami || echo 'System'").trim()
@@ -243,7 +242,7 @@ EOF
             }
         }
 
-        // Étape 5: Build et tests avec configuration CORRIGÉE
+        // Étape 5: Build et tests
         stage('Build & Unit Tests') {
             steps { 
                 sh '''
@@ -335,29 +334,6 @@ EOF
                             } catch (Exception e) {
                                 echo "⚠️ JaCoCo report publication failed: ${e.message}"
                             }
-                            
-                            // Verify JaCoCo XML report
-                            if (fileExists('target/site/jacoco/jacoco.xml')) {
-                                echo "✅ JaCoCo XML report generated successfully"
-                                try {
-                                    def coverageData = sh(returnStdout: true, script: '''
-                                        if [ -f "target/site/jacoco/jacoco.xml" ]; then
-                                            line_coverage=$(grep -o "line-coverage=\\"[^\\"]*\\"" target/site/jacoco/jacoco.xml | head -1 | cut -d"\\"" -f2)
-                                            branch_coverage=$(grep -o "branch-coverage=\\"[^\\"]*\\"" target/site/jacoco/jacoco.xml | head -1 | cut -d"\\"" -f2)
-                                            echo "Line Coverage: ${line_coverage:-0}%"
-                                            echo "Branch Coverage: ${branch_coverage:-0}%"
-                                        else
-                                            echo "Line Coverage: 0%"
-                                            echo "Branch Coverage: 0%"
-                                        fi
-                                    ''').trim()
-                                    echo "📈 ${coverageData}"
-                                } catch (Exception e) {
-                                    echo "⚠️ Could not read coverage details: ${e.message}"
-                                }
-                            } else {
-                                echo "❌ JaCoCo XML report not found"
-                            }
                         } else {
                             echo "❌ No JaCoCo execution data found at target/jacoco.exec"
                         }
@@ -370,12 +346,6 @@ EOF
                             echo "✅ WAR file archived: ${warFiles[0].name} (${warSize} bytes)"
                         } else {
                             echo "⚠️ No WAR file found in target directory"
-                            // Check for JAR files as alternative
-                            def jarFiles = findFiles(glob: 'target/*.jar')
-                            if (jarFiles.size() > 0 && !jarFiles[0].path.contains('sources') && !jarFiles[0].path.contains('javadoc')) {
-                                archiveArtifacts artifacts: '**/target/*.jar', allowEmptyArchive: false
-                                echo "✅ JAR file archived: ${jarFiles[0].name}"
-                            }
                         }
                     }
                 }
@@ -388,42 +358,41 @@ EOF
             }
         }
 
-        // Étape 6: Analyse qualité et sécurité du code
-        // CORRECTION: Remplacer la section SonarQube avec des credentials sécurisés
-stage('Code Quality & SAST') {
-    steps {
-        script {
-            echo "🔧 Running SonarQube analysis with enhanced configuration..."
-            
-            try {
-                withSonarQubeEnv('sonar-server') {
-                    withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_AUTH_TOKEN')]) {
-                        sh '''
-                            echo "🔍 Starting SonarQube analysis..."
-                            mvn -B sonar:sonar \
-                                -Dsonar.projectKey=vprofile-application-${BUILD_NUMBER} \
-                                -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
-                                -Dsonar.junit.reportsPath=target/surefire-reports \
-                                -Dsonar.java.binaries=target/classes \
-                                -Dsonar.java.test.binaries=target/test-classes \
-                                -Dsonar.sourceEncoding=UTF-8 \
-                                -Dsonar.java.source=17 \
-                                -Dsonar.projectVersion=2.0 \
-                                -Dsonar.scm.provider=git
-                        '''
+        // Étape 6: Analyse qualité et sécurité du code - CORRIGÉE
+        stage('Code Quality & SAST') {
+            steps {
+                script {
+                    echo "🔧 Running SonarQube analysis with enhanced configuration..."
+                    
+                    try {
+                        withSonarQubeEnv('sonar-server') {
+                            withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_AUTH_TOKEN')]) {
+                                sh '''
+                                    echo "🔍 Starting SonarQube analysis..."
+                                    mvn -B sonar:sonar \
+                                        -Dsonar.projectKey=vprofile-application-${BUILD_NUMBER} \
+                                        -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+                                        -Dsonar.junit.reportsPath=target/surefire-reports \
+                                        -Dsonar.java.binaries=target/classes \
+                                        -Dsonar.java.test.binaries=target/test-classes \
+                                        -Dsonar.sourceEncoding=UTF-8 \
+                                        -Dsonar.java.source=17 \
+                                        -Dsonar.projectVersion=2.0 \
+                                        -Dsonar.scm.provider=git
+                                '''
+                            }
+                        }
+                        echo "✅ SonarQube analysis completed successfully"
+                    } catch (Exception e) {
+                        echo "❌ SonarQube analysis failed: ${e.message}"
+                        echo "🔄 Continuing pipeline without SonarQube analysis"
+                        if (currentBuild.result != 'FAILURE') {
+                            currentBuild.result = 'UNSTABLE'
+                        }
                     }
-                }
-                echo "✅ SonarQube analysis completed successfully"
-            } catch (Exception e) {
-                echo "❌ SonarQube analysis failed: ${e.message}"
-                echo "🔄 Continuing pipeline without SonarQube analysis"
-                if (currentBuild.result != 'FAILURE') {
-                    currentBuild.result = 'UNSTABLE'
                 }
             }
         }
-    }
-}
 
         // Étape 7: Quality Gate conditionnelle
         stage('Quality Gate') {
@@ -486,14 +455,6 @@ stage('Code Quality & SAST') {
                                 if (fileExists('target/dependency-check-report')) {
                                     archiveArtifacts artifacts: 'target/dependency-check-report/*', allowEmptyArchive: true
                                     echo "✅ Dependency check reports archived"
-                                    
-                                    // Generate readable dependency report
-                                    if (fileExists('target/dependency-check-report/dependency-check-report.html')) {
-                                        sh '''
-                                            cp target/dependency-check-report/dependency-check-report.html dependency-vulnerability-report.html
-                                        '''
-                                        archiveArtifacts artifacts: 'dependency-vulnerability-report.html', allowEmptyArchive: true
-                                    }
                                 }
                             }
                         }
@@ -739,7 +700,7 @@ stage('Code Quality & SAST') {
                 // Archive all important reports
                 sh '''
                     echo "📁 Archiving final reports..."
-                    ls -la *.html *.md *.json *.xml 2>/dev/null | head -20 || echo "No report files found"
+                    ls -la *.html *.md *.json 2>/dev/null | head -20 || echo "No report files found"
                 '''
                 
                 // Final cleanup
@@ -792,6 +753,10 @@ stage('Code Quality & SAST') {
                             securityFindings = readJSON file: 'security-findings.json'
                         }
                         
+                        def totalCritical = securityFindings.critical + securityFindings.trivy_critical
+                        def totalHigh = securityFindings.high + securityFindings.trivy_high
+                        def totalMedium = securityFindings.medium + securityFindings.trivy_medium
+                        
                         emailext (
                             subject: "⚠️ UNSTABLE: DevSecOps Pipeline - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                             body: """
@@ -803,8 +768,9 @@ stage('Code Quality & SAST') {
                             
                             <h3>Security Findings:</h3>
                             <ul>
-                                <li>🔴 Critical Vulnerabilities: ${securityFindings.critical + securityFindings.trivy_critical}</li>
-                                <li>🟠 High Vulnerabilities: ${securityFindings.high + securityFindings.trivy_high}</li>
+                                <li>🔴 Critical Vulnerabilities: ${totalCritical}</li>
+                                <li>🟠 High Vulnerabilities: ${totalHigh}</li>
+                                <li>🟡 Medium Vulnerabilities: ${totalMedium}</li>
                                 <li>🔑 Secrets Exposed: ${securityFindings.secrets}</li>
                                 <li>🐛 Code Issues: ${securityFindings.semgrep}</li>
                             </ul>
@@ -1095,6 +1061,7 @@ ${totalCritical == 0 && totalHigh == 0 ? '- **Maintenance**: Continue current se
 def sendSlackNotification(securityFindings, finalStatus) {
     def totalCritical = securityFindings.critical + securityFindings.trivy_critical
     def totalHigh = securityFindings.high + securityFindings.trivy_high
+    def totalMedium = securityFindings.medium + securityFindings.trivy_medium
     
     def color = 'good'
     def statusIcon = '✅'
@@ -1117,7 +1084,7 @@ def sendSlackNotification(securityFindings, finalStatus) {
         channel: '#devsecops',
         color: color,
         message: """${statusIcon} DevSecOps Pipeline ${finalStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-🔴 Critical: ${totalCritical} | 🟠 High: ${totalHigh} | 🟡 Medium: ${securityFindings.medium + securityFindings.trivy_medium}
+🔴 Critical: ${totalCritical} | 🟠 High: ${totalHigh} | 🟡 Medium: ${totalMedium}
 🔑 Secrets: ${securityFindings.secrets} | 🐛 Issues: ${securityFindings.semgrep}
 📊 Build: ${finalStatus} | ⏱️ Duration: ${currentBuild.durationString.replace(' and counting', '')}
 👤 Author: ${env.GIT_AUTHOR ?: 'N/A'}
@@ -1149,6 +1116,7 @@ def sendEmailNotification(securityFindings, finalStatus) {
         <ul>
             <li>✅ Critical Vulnerabilities: ${totalCritical}</li>
             <li>✅ High Vulnerabilities: ${totalHigh}</li>
+            <li>✅ Medium Vulnerabilities: ${totalMedium}</li>
             <li>✅ Secrets Exposed: ${securityFindings.secrets}</li>
             <li>✅ Code Issues: ${securityFindings.semgrep}</li>
         </ul>
@@ -1181,6 +1149,7 @@ def sendEmailNotification(securityFindings, finalStatus) {
         <ul>
             ${totalCritical > 0 ? '<li>🔴 Immediately address critical vulnerabilities</li>' : ''}
             ${totalHigh > 0 ? '<li>🟠 Plan remediation for high severity issues</li>' : ''}
+            ${totalMedium > 0 ? '<li>🟡 Monitor medium severity vulnerabilities</li>' : ''}
             ${securityFindings.secrets > 0 ? '<li>🔴 Rotate exposed credentials immediately</li>' : ''}
             ${securityFindings.semgrep > 0 ? '<li>🟠 Review and fix SAST findings</li>' : ''}
         </ul>
