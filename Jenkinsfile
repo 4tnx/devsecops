@@ -65,19 +65,29 @@ pipeline {
         }
 
         stage('Trivy Scan') {
-            steps {
-                sh '''
-                echo "Running Trivy vulnerability scan..."
-                mkdir -p trivy_reports
-                trivy image --format template --template "@/usr/local/share/trivy/templates/html.tpl" -o trivy_reports/trivy-report.html testfoodfreezy || true
-                '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'trivy_reports/*.html', allowEmptyArchive: true
-                }
-            }
+    steps {
+        sh '''
+        echo "Running Trivy vulnerability scan (local installation)..."
+
+        # Create report directory
+        mkdir -p trivy_reports
+
+        # Run Trivy image scan using local DB cache
+        trivy image \
+            --cache-dir /var/lib/trivy \
+            --skip-db-update \
+            --format template \
+            --template /usr/local/share/trivy/templates/html.tpl \
+            -o trivy_reports/trivy-report.html \
+            testfoodfreezy || true
+        '''
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: 'trivy_reports/*.html', allowEmptyArchive: true
         }
+    }
+}
 
         stage('OWASP Dependency-Check Vulnerabilities') {
           steps {
