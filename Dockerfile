@@ -1,24 +1,14 @@
-# Use Tomcat with Java 17 or 21 (recommended modern)
-FROM tomcat:10-jdk21
+# Use a specific valid OpenJDK 17 slim image
+FROM eclipse-temurin:17-jdk
 
-LABEL Project="devsecops"
-LABEL Author="4tnx"
+# Set working directory
+WORKDIR /app
 
-# Clean default webapps
-RUN rm -rf /usr/local/tomcat/webapps/*
+# Copy built jar into container
+COPY target/*.jar app.jar
 
-# Copy WAR (from Jenkins pipeline output)
-COPY target/*.war /usr/local/tomcat/webapps/ROOT.war
-
-# Expose port
+# Expose port your app runs on
 EXPOSE 8080
 
-# Healthcheck
-HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
-  CMD curl --silent --fail http://localhost:8080/ || exit 1
-
-# Working directory
-WORKDIR /usr/local/tomcat/
-
-# Start Tomcat
-CMD ["catalina.sh", "run"]
+# Run the app
+ENTRYPOINT ["java", "-jar", "app.jar"]

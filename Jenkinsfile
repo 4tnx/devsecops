@@ -11,465 +11,222 @@ pipeline {
     }
 
     stages {
-        stage('Clean Workspace') {
-            steps {
-                cleanWs()
-                sh 'find . -name "target" -type d -exec rm -rf {} + 2>/dev/null || true'
-            }
-        }
 
         stage('Checkout') {
             steps {
-                checkout scm
-            }
-        }
-
-        stage('Setup Environment') {
-            steps {
-                sh '''
-                echo "Setting up environment..."
-                mkdir -p trivy_reports zap_reports secrets_reports dependency_check_reports
-                '''
-            }
-        }
-
-        stage('Validate POM') {
-            steps {
-                sh '''
-                echo "Validating POM file..."
-                if [ -f pom.xml ]; then
-                    if grep -q "<project" pom.xml && grep -q "</project>" pom.xml; then
-                        echo "POM structure appears valid"
-                    else
-                        echo "POM may have structural issues"
-                    fi
-                else
-                    echo "No POM file found!"
-                    exit 1
-                fi
-                '''
+                deleteDir()
+                checkout([$class: 'GitSCM',
+                          branches: [[name: 'main']],
+                          userRemoteConfigs: [[url: 'https://github.com/4tnx/devsecops']]
+                ])
             }
         }
 
         stage('Semgrep SAST') {
             steps {
                 sh '''
-                echo "Running Semgrep SAST scan..."
+                echo "Running Semgrep…"
                 docker run --rm -v $PWD:/src returntocorp/semgrep \
-                    semgrep --config=p/owasp-top-ten /src > semgrep-report.json 2>/dev/null || echo "Semgrep scan completed"
+                    semgrep --config=p/owasp-top-ten /src > semgrep-report.json
                 '''
                 archiveArtifacts artifacts: 'semgrep-report.json', allowEmptyArchive: true
             }
-        }
 
-        stage('Build Application') {
-            steps {
-                sh '''
-                echo "Building application..."
-                mvn clean compile -DskipTests=true
-                '''
-            }
         }
 
         stage('SpotBugs Analysis') {
             steps {
-                sh '''
-                echo "Running SpotBugs analysis..."
-                mvn spotbugs:spotbugs -Dspotbugs.failOnError=false
-                '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'target/spotbugsXml.xml', allowEmptyArchive: true
-                }
+                sh 'mvn clean compile spotbugs:check || true'
+                archiveArtifacts artifacts: 'target/spotbugsXml.xml', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'target/site/spotbugs.html', allowEmptyArchive: true
             }
         }
 
-        stage('Dependency-Check with Docker - FIXED') {
+        stage('Build + Test') {
             steps {
-                sh '''
-                echo "Running OWASP Dependency-Check with Docker..."
-                
-                # Create output directory
-                mkdir -p dependency_check_reports
-                
-                # Use correct Docker command syntax
-                docker run --rm \\
-                    -v $PWD:/src \\
-                    -v /tmp/dependency-check-data:/usr/share/dependency-check/data \\
-                    owasp/dependency-check:latest \\
-                    /bin/bash -c "dependency-check.sh \\
-                    --scan /src \\
-                    --format HTML \\
-                    --format JSON \\
-                    --out /src/dependency_check_reports \\
-                    --project "vprofile-app" \\
-                    --enableExperimental \\
-                    --disableYarnAudit \\
-                    --disableNodeAudit \\
-                    --noupdate" || echo "Dependency-Check completed with exit code: $?"
-                
-                # Check if reports were generated
-                echo "Generated reports:"
-                ls -la dependency_check_reports/ || echo "No dependency check reports found"
-                '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'dependency_check_reports/*', allowEmptyArchive: true
-                }
+                sh 'mvn clean verify -DskipTests=false'
             }
         }
 
-        stage('Secrets Scan') {
+        stage('Verify Workspace') {
             steps {
                 sh '''
-                echo "Running secrets detection..."
-                mkdir -p secrets_reports
-                docker run --rm -v $PWD:/code zricethezav/gitleaks:latest detect \\
-                    --source=/code \\
-                    --report-format=json \\
-                    --report-path=/code/secrets_reports/gitleaks-report.json \\
-                    --verbose || echo "Gitleaks scan completed"
-                '''
-                archiveArtifacts artifacts: 'secrets_reports/*.json', allowEmptyArchive: true
-            }
-        }
-
-        stage('Update Trivy DB') {
-            steps {
-                sh '''
-                echo "Updating Trivy vulnerability database..."
-                
-                # Use persistent cache location in Jenkins home
-                TRIVY_CACHE="/var/lib/jenkins/trivy-cache"
-                sudo mkdir -p $TRIVY_CACHE
-                sudo chown -R jenkins:jenkins $TRIVY_CACHE
-                
-                # Update DB only once per day (check if DB is older than 24 hours)
-                if [ ! -f "$TRIVY_CACHE/db/trivy.db" ] || \\
-                   [ $(find "$TRIVY_CACHE/db/trivy.db" -mtime +0 2>/dev/null) ]; then
-                    echo "Downloading fresh Trivy DB..."
-                    docker run --rm \\
-                        -v "$TRIVY_CACHE:/root/.cache" \\
-                        aquasec/trivy:latest \\
-                        image --download-db-only
-                    
-                    # Verify download success
-                    if [ -f "$TRIVY_CACHE/db/trivy.db" ]; then
-                        DB_SIZE=$(du -h "$TRIVY_CACHE/db/trivy.db" | cut -f1)
-                        echo "✅ Trivy DB downloaded successfully: $DB_SIZE"
-                    else
-                        echo "⚠️ Trivy DB download may have failed, but continuing..."
-                    fi
-                else
-                    echo "Using cached Trivy DB (less than 24 hours old)"
-                    DB_SIZE=$(du -h "$TRIVY_CACHE/db/trivy.db" 2>/dev/null | cut -f1 || echo "Unknown")
-                    echo "Cached DB size: $DB_SIZE"
-                fi
-                '''
-            }
-        }
-
-        stage('Optimize Build') {
-            steps {
-                sh '''
-                echo "Analyzing dependencies for optimization..."
-                # Check for large dependencies
-                mvn dependency:tree -Dverbose > dependency-tree.txt
-                
-                echo "Current dependency tree saved to dependency-tree.txt"
-                echo "Packaging with optimized settings..."
-                
-                # Clean package with dependency optimization
-                mvn clean package -DskipTests=true -Dcheckstyle.skip=true -Dpmd.skip=true
-                
-                echo "Generated WAR file size:"
-                ls -lh target/*.war 2>/dev/null || echo "No WAR file found"
-                
-                # Analyze WAR contents
-                if [ -f "target/*.war" ]; then
-                    echo "Top 10 largest files in WAR:"
-                    unzip -l target/*.war | sort -nr -k1 | head -10
-                fi
+                    echo "Current directory: $(pwd)"
+                    echo "Files in workspace:"
+                    ls -la
                 '''
             }
         }
 
         stage('Build Docker Image') {
-            when {
-                expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
-            }
             steps {
-                sh '''
-                echo "Building Docker image..."
-                if [ ! -f "Dockerfile" ]; then
-                    echo "Creating optimized Dockerfile..."
-                    cat > Dockerfile << 'EOF'
-FROM tomcat:10-jdk21
-RUN rm -rf /usr/local/tomcat/webapps/*
-COPY target/*.war /usr/local/tomcat/webapps/ROOT.war
-WORKDIR /usr/local/tomcat/
-EXPOSE 8080
-CMD ["catalina.sh", "run"]
-EOF
-                fi
-                docker build -t testfoodfreezy .
-                echo "Docker image built successfully"
-                
-                # Check image size
-                echo "Docker image details:"
-                docker images testfoodfreezy
-                '''
+                sh 'docker build -f $WORKSPACE/Dockerfile -t testfoodfreezy $WORKSPACE'
             }
         }
 
-        stage('Fast Trivy Scan') {
-            when {
-                expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
-            }
+        stage('Trivy Scan') {
             steps {
                 sh '''
-                echo "Running FAST Trivy scan with cached DB..."
+                echo "Running Trivy vulnerability scan..."
                 mkdir -p trivy_reports
-                
-                TRIVY_CACHE="/var/lib/jenkins/trivy-cache"
-                
-                # Fast scan using cached DB - skip all updates
-                docker run --rm \\
-                    -v /var/run/docker.sock:/var/run/docker.sock \\
-                    -v $PWD/trivy_reports:/output \\
-                    -v "$TRIVY_CACHE:/root/.cache" \\
-                    aquasec/trivy:latest \\
-                    image \\
-                    --skip-db-update \\
-                    --skip-java-db-update \\
-                    --scanners vuln \\
-                    --format template \\
-                    --template "@contrib/html.tpl" \\
-                    -o /output/trivy-fast.html \\
-                    --severity HIGH,CRITICAL \\
-                    testfoodfreezy
-                
-                echo "✅ Fast vulnerability scan completed (using cached DB)"
+                trivy image --format template --template "@/usr/local/share/trivy/templates/html.tpl" -o trivy_reports/trivy-report.html testfoodfreezy || true
                 '''
             }
             post {
                 always {
                     archiveArtifacts artifacts: 'trivy_reports/*.html', allowEmptyArchive: true
-                    sh '''
-                    # Display scan summary
-                    if [ -f "trivy_reports/trivy-fast.html" ]; then
-                        echo "Trivy report generated: trivy_reports/trivy-fast.html"
-                        # Extract basic vulnerability info
-                        if grep -q "HIGH" trivy_reports/trivy-fast.html 2>/dev/null; then
-                            HIGH_COUNT=$(grep -o "HIGH" trivy_reports/trivy-fast.html | wc -l)
-                            echo "HIGH severity vulnerabilities: $HIGH_COUNT"
-                        else
-                            echo "No HIGH severity vulnerabilities found"
-                        fi
-                        
-                        if grep -q "CRITICAL" trivy_reports/trivy-fast.html 2>/dev/null; then
-                            CRITICAL_COUNT=$(grep -o "CRITICAL" trivy_reports/trivy-fast.html | wc -l)
-                            echo "CRITICAL severity vulnerabilities: $CRITICAL_COUNT"
-                        else
-                            echo "No CRITICAL severity vulnerabilities found"
-                        fi
-                    else
-                        echo "No Trivy report generated"
-                    fi
-                    '''
                 }
             }
         }
 
-        stage('Comprehensive Trivy Scan') {
-            when {
-                expression { 
-                    // Run comprehensive scan only on demand or once per week
-                    def day = new Date().format('u')
-                    return currentBuild.resultIsBetterOrEqualTo('SUCCESS') && (day == '1' || env.RUN_FULL_SCAN == 'true')
-                }
-            }
+        stage('OWASP Dependency-Check Vulnerabilities') {
+          steps {
+            dependencyCheck additionalArguments: '''
+                --scan "./target"
+                --enableExperimental
+                -f "ALL"
+                --prettyPrint
+            ''', odcInstallation: 'DP-Check'
+            dependencyCheckPublisher pattern: 'dependency-check-report.xml'
+            archiveArtifacts artifacts: 'dependency-check-report.html', allowEmptyArchive: true
+          }
+        }
+
+        stage('Secrets Scan - Gitleaks') {
             steps {
-                sh '''
-                echo "Running comprehensive Trivy scan (includes Java DB)..."
-                mkdir -p trivy_reports
-                
-                TRIVY_CACHE="/var/lib/jenkins/trivy-cache"
-                
-                # Comprehensive scan with Java DB (takes longer)
-                docker run --rm \\
-                    -v /var/run/docker.sock:/var/run/docker.sock \\
-                    -v $PWD/trivy_reports:/output \\
-                    -v "$TRIVY_CACHE:/root/.cache" \\
-                    aquasec/trivy:latest \\
-                    image \\
-                    --skip-db-update \\
-                    --scanners vuln,secret,config \\
-                    --format template \\
-                    --template "@contrib/html.tpl" \\
-                    -o /output/trivy-comprehensive.html \\
-                    --severity HIGH,CRITICAL \\
-                    testfoodfreezy
-                
-                echo "✅ Comprehensive vulnerability scan completed"
-                '''
+                script {
+                    sh "mkdir -p ${WORKSPACE}/secrets_reports"
+
+                    sh """
+                    docker run --rm -v ${WORKSPACE}:/code zricethezav/gitleaks:latest detect \
+                        --source=/code \
+                        --report-format=json \
+                        --report-path=/code/secrets_reports/gitleaks-report.json
+                    """
+                }
+                archiveArtifacts artifacts: 'secrets_reports/*.json'
             }
         }
 
-        stage('Run WebApp for Testing') {
-            when {
-                expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
-            }
+        stage('Run WebApp') {
             steps {
                 sh '''
-                echo "Starting application for testing..."
-                # Stop any existing container
-                docker stop test-app 2>/dev/null || true
-                docker rm test-app 2>/dev/null || true
-                
-                # Start new container
-                docker run -d --name test-app -p 8080:8080 testfoodfreezy
-                echo "Application started in Docker container"
-                
-                # Wait for app to be ready with retries
-                echo "Waiting for application to start..."
+                nohup java -jar target/*.jar > app.log 2>&1 &
                 for i in {1..30}; do
-                    if curl -s http://localhost:8080/ > /dev/null; then
-                        echo "✅ Application is running successfully"
-                        break
+                    if curl -s http://localhost:8080/  > /dev/null; then
+                        echo "Application is up!"
+                        exit 0
                     fi
-                    echo "Attempt $i/30: Application not ready yet..."
-                    sleep 5
+                    echo "Waiting app to be ready..."
+                    sleep 2
                 done
-                
-                # Final check
-                if ! curl -s http://localhost:8080/ > /dev/null; then
-                    echo "⚠️  Application may not be fully started"
-                    # Check container logs
-                    docker logs test-app | tail -20
-                fi
+                echo "Application failed to start!"
+                exit 1
                 '''
             }
+        }
+
+        stage("ZAP Scan") {
+            steps {
+                script {
+                    sh "docker rm -f zap 2>/dev/null || true"
+
+                    sh """
+                        docker run -d --network host --name zap ghcr.io/zaproxy/zaproxy:stable sleep infinity
+                    """
+                    sh "docker exec zap mkdir -p /zap/wrk"
+
+                    def zapExit = sh(
+                        script: "docker exec zap zap-full-scan.py -t http://localhost:8080 -r /zap/report.html",
+                        returnStatus: true
+                    )
+
+                    sh "mkdir -p ${WORKSPACE}/zap_reports"
+                    sh "docker cp zap:/zap/report.html ${WORKSPACE}/zap_reports/report.html"
+
+                    echo "ZAP scan finished with exit code: ${zapExit}"
+
+                    if (zapExit == 1 || zapExit == 3) {
+                        error "ZAP scan failed"
+                    }
+                }
+            }
+
             post {
                 always {
-                    sh '''
-                    # Stop and cleanup
-                    echo "Stopping test application..."
-                    docker stop test-app 2>/dev/null || true
-                    docker rm test-app 2>/dev/null || true
-                    echo "Test application stopped"
-                    '''
+                    archiveArtifacts artifacts: 'zap_reports/*.html', allowEmptyArchive: true
+                    sh "docker rm -f zap || true"
                 }
             }
         }
 
         stage('Sonar Analysis') {
-            when {
-                expression { currentBuild.resultIsBetterOrEqualTo('SUCCESS') }
-            }
             steps {
                 withSonarQubeEnv('SonarQubeServer') {
-                    sh """
-                    mvn sonar:sonar \\
-                        -Dsonar.projectKey=devops_java \\
-                        -Dsonar.host.url=http://192.168.50.4:9000 \\
-                        -Dsonar.login=${SONAR_TOKEN} \\
-                        -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \\
-                        -Dsonar.sourceEncoding=UTF-8 \\
-                        -Dsonar.tests=src/test/java \\
-                        -Dsonar.java.binaries=target/classes
-                    """
+                    sh "mvn sonar:sonar -Dsonar.projectKey=devops_java -Dsonar.host.url=http://192.168.50.4:9000 -Dsonar.login=${SONAR_TOKEN}"
                 }
             }
         }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 1, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: false
+                }
+            }
+        }
+
     }
 
     post {
         always {
             script {
-                // Collect all reports
+                def buildStatus = currentBuild.currentResult
+                def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub User'
+                def buildUrl = "${env.BUILD_URL}"
+
                 sh '''
-                echo "Collecting security reports..."
-                mkdir -p reports
-                
-                # Copy available reports with proper error handling
-                cp semgrep-report.json reports/ 2>/dev/null || echo "No Semgrep report"
-                cp dependency_check_reports/* reports/ 2>/dev/null || echo "No Dependency Check report"
-                cp secrets_reports/*.json reports/ 2>/dev/null || echo "No Secrets report"
-                cp trivy_reports/*.html reports/ 2>/dev/null || echo "No Trivy report"
-                cp target/spotbugsXml.xml reports/ 2>/dev/null || echo "No SpotBugs report"
-                
-                # Create summary file
-                echo "=== SECURITY SCAN SUMMARY ===" > reports/summary.txt
-                echo "Build: ${env.JOB_NAME} #${env.BUILD_NUMBER}" >> reports/summary.txt
-                echo "Timestamp: $(date)" >> reports/summary.txt
-                echo "Status: ${currentBuild.currentResult}" >> reports/summary.txt
-                echo "" >> reports/summary.txt
-                echo "Generated Reports:" >> reports/summary.txt
-                ls -la reports/ >> reports/summary.txt 2>/dev/null || echo "No reports found" >> reports/summary.txt
-                
-                echo "=== Final Reports ==="
-                ls -la reports/ 2>/dev/null || echo "No reports directory"
+                    mkdir -p reports
+                    cp semgrep-report.json reports/ 2>/dev/null || true
+                    cp target/spotbugsXml.xml reports/ 2>/dev/null || true
+                    cp target/site/spotbugs.html reports/ 2>/dev/null || true
+                    cp dependency-check-report.html reports/ 2>/dev/null || true
+                    cp secrets_reports/*.json reports/ 2>/dev/null || true
+                    cp zap_reports/*.html reports/ 2>/dev/null || true
+                    cp trivy_reports/*.html reports/ 2>/dev/null || true
                 '''
-                
-                // Package reports
+
+                sh 'echo "--- Reports Collected ---" && ls -la reports || true'
+
                 sh '''
-                echo "Packaging reports..."
-                tar -czf reports.tar.gz reports/ 2>/dev/null || echo "Failed to package reports"
+                    if command -v zip >/dev/null 2>&1; then
+                        zip -r reports.zip reports/
+                    else
+                        tar -czf reports.tar.gz reports/
+                    fi
                 '''
-                
-                // Cleanup Docker resources (but keep Trivy cache)
-                sh '''
-                echo "Cleaning up Docker resources..."
-                docker system prune -f 2>/dev/null || true
-                '''
+
+                emailext(
+                    to: 'mekni.amin75@gmail.com',
+                    subject: "📊 Security Pipeline ${buildStatus} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        <p>Hello,</p>
+                        <p>The security pipeline has completed with status: <b>${buildStatus}</b>.</p>
+                        <ul>
+                            <li><b>Project:</b> ${env.JOB_NAME}</li>
+                            <li><b>Build Number:</b> ${env.BUILD_NUMBER}</li>
+                            <li><b>Triggered by:</b> ${buildUser}</li>
+                            <li><b>Jenkins Build URL:</b> <a href="${buildUrl}">${buildUrl}</a></li>
+                        </ul>
+                        <p>All generated reports (Semgrep, SpotBugs, Dependency-Check, Secrets, Trivy, and ZAP) are attached.</p>
+                        <hr>
+                        <p>— Jenkins CI/CD Security Pipeline</p>
+                    """,
+                    mimeType: 'text/html',
+                    attachmentsPattern: 'reports/**',
+                    attachLog: true
+                )
             }
-            
-            // Email notification
-            emailext(
-                to: 'mekni.amin75@gmail.com',
-                subject: "🔒 Pipeline ${currentBuild.currentResult} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                body: """
-                    <h3>🔒 Security Pipeline Complete</h3>
-                    <p><b>Status:</b> ${currentBuild.currentResult}</p>
-                    <p><b>Project:</b> ${env.JOB_NAME}</p>
-                    <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
-                    <p><b>Duration:</b> ${currentBuild.durationString}</p>
-                    
-                    <h4>📊 Security Scans Completed:</h4>
-                    <ul>
-                        <li>✅ Semgrep SAST</li>
-                        <li>✅ SpotBugs Analysis</li>
-                        <li>✅ OWASP Dependency-Check (Fixed)</li>
-                        <li>✅ Gitleaks Secrets Detection</li>
-                        <li>✅ Trivy Container Scan (Fast Mode with Cached DB)</li>
-                        <li>✅ Application Build & Package</li>
-                        <li>✅ SonarQube Analysis</li>
-                    </ul>
-                    
-                    <p><i>All security reports are attached. Trivy scans now use cached DB for faster execution.</i></p>
-                """,
-                mimeType: 'text/html',
-                attachmentsPattern: 'reports.*',
-                attachLog: true
-            )
-        }
-        
-        success {
-            sh '''
-            echo "🎉 Pipeline completed successfully!"
-            echo "Trivy DB caching enabled - subsequent runs will be much faster!"
-            echo "All security scans and builds completed."
-            '''
-        }
-        
-        failure {
-            sh '''
-            echo "❌ Pipeline failed!"
-            echo "Check the logs for specific errors."
-            '''
         }
     }
 }
