@@ -5,7 +5,7 @@ def COLOR_MAP = [
     'UNSTABLE': 'warning',
     'ABORTED': '#CCCCCC'
 ]
-
+//test
 pipeline {
     agent any
 
