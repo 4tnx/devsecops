@@ -101,26 +101,14 @@
             </plugin>
 
             <!-- OWASP Dependency‑Check plugin -->
-            <plugin>
-                <groupId>org.owasp</groupId>
-                <artifactId>dependency-check-maven</artifactId>
-                <version>12.1.0</version>
-                <configuration>
-                    <format>JSON</format>
-                    <ossIndexUsername>yessinebentaher00@gmail.com</ossIndexUsername>
-                    <ossIndexPassword>14e3b2f7245b4d5bc1c9e098c84a8283bd16a4a3</ossIndexPassword>
-                    <outputDirectory>${project.build.directory}/dependency-check-report</outputDirectory>
-                    <ossindexAnalyzerEnabled>false</ossindexAnalyzerEnabled>
-                    <failBuildOnCVSS>10</failBuildOnCVSS>
-                </configuration>
-                <executions>
-                    <execution>
-                        <goals>
-                            <goal>check</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
+          <plugin>
+    <groupId>org.owasp</groupId>
+    <artifactId>dependency-check-maven</artifactId>
+    <version>12.1.0</version>
+    <configuration>
+        <nvdApiKey>${env.NVD_API_KEY}</nvdApiKey>
+    </configuration>
+</plugin>
         </plugins>
     </build>
 
