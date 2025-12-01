@@ -179,7 +179,7 @@ pipeline {
             }
         }
 
-        stage('Post Build Actions') {
+        stage('Collect Reports & Notify') {
             steps {
                 script {
                     // --- Collect all reports ---
@@ -195,8 +195,14 @@ pipeline {
                         cp app.log all_reports/ 2>/dev/null || true
                     '''
 
+                    // Archive all reports
                     archiveArtifacts artifacts: 'all_reports/**', allowEmptyArchive: true
-
+                    
+                    // Store build status for email
+                    sh 'echo "BUILD_STATUS=${currentBuild.currentResult}" > build_status.env'
+                    sh 'echo "BUILD_NUMBER=${env.BUILD_NUMBER}" >> build_status.env'
+                    sh 'echo "JOB_NAME=${env.JOB_NAME}" >> build_status.env'
+                    
                     // Slack notification
                     sh """
                     curl -X POST -H 'Content-type: application/json' \
@@ -205,53 +211,57 @@ pipeline {
                     """
                 }
             }
-        }
-    }
-
-    post {
-        always {
-            emailext(
-                to: 'mekni.amin75@gmail.com',
-                subject: "📌 Jenkins Security Pipeline - ${currentBuild.currentResult} | ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                body: """
-                    <html>
-                    <body>
-                        <h2>🔐 DevSecOps Pipeline Report</h2>
-                        <p>Hello,</p>
+            post {
+                always {
+                    // Send email without workspace dependencies
+                    script {
+                        def buildStatus = sh(script: 'cat build_status.env | grep BUILD_STATUS | cut -d= -f2', returnStdout: true).trim()
+                        def buildNumber = sh(script: 'cat build_status.env | grep BUILD_NUMBER | cut -d= -f2', returnStdout: true).trim()
+                        def jobName = sh(script: 'cat build_status.env | grep JOB_NAME | cut -d= -f2', returnStdout: true).trim()
                         
-                        <p>The pipeline has completed with the following details:</p>
-                        
-                        <ul>
-                            <li><b>Status:</b> ${currentBuild.currentResult}</li>
-                            <li><b>Project:</b> ${env.JOB_NAME}</li>
-                            <li><b>Build Number:</b> ${env.BUILD_NUMBER}</li>
-                            <li><b>Branch:</b> ${env.GIT_BRANCH}</li>
-                            <li><b>Triggered By:</b> ${currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub Trigger'}</li>
-                            <li><b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></li>
-                        </ul>
-                        
-                        <hr>
-                        <h3>📄 Reports Included</h3>
-                        <ul>
-                            <li>Semgrep SAST</li>
-                            <li>SpotBugs</li>
-                            <li>OWASP Dependency Check</li>
-                            <li>Gitleaks Secrets Scan</li>
-                            <li>Trivy Container Scan</li>
-                            <li>ZAP DAST Scan</li>
-                        </ul>
-                        
-                        <p>All reports are attached to this email.</p>
-                        <hr>
-                        
-                        <p style="font-size:12px;color:#777;">✔ Automated by Jenkins DevSecOps Pipeline</p>
-                    </body>
-                    </html>
-                """,
-                mimeType: 'text/html',
-                attachmentsPattern: 'all_reports/**, app.log',
-                attachLog: true
-            )
+                        emailext(
+                            to: 'mekni.amin75@gmail.com',
+                            subject: "📌 Jenkins Security Pipeline - ${buildStatus} | ${jobName} #${buildNumber}",
+                            body: """
+                                <html>
+                                <body>
+                                    <h2>🔐 DevSecOps Pipeline Report</h2>
+                                    <p>Hello,</p>
+                                    
+                                    <p>The pipeline has completed with the following details:</p>
+                                    
+                                    <ul>
+                                        <li><b>Status:</b> ${buildStatus}</li>
+                                        <li><b>Project:</b> ${jobName}</li>
+                                        <li><b>Build Number:</b> ${buildNumber}</li>
+                                        <li><b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></li>
+                                    </ul>
+                                    
+                                    <hr>
+                                    <h3>📄 Security Scans Performed</h3>
+                                    <ul>
+                                        <li>Semgrep SAST</li>
+                                        <li>SpotBugs</li>
+                                        <li>OWASP Dependency Check</li>
+                                        <li>Gitleaks Secrets Scan</li>
+                                        <li>Trivy Container Scan</li>
+                                        <li>ZAP DAST Scan</li>
+                                        <li>SonarQube Analysis</li>
+                                    </ul>
+                                    
+                                    <p>All reports are archived in Jenkins and can be downloaded from the build page.</p>
+                                    <hr>
+                                    
+                                    <p style="font-size:12px;color:#777;">✔ Automated by Jenkins DevSecOps Pipeline</p>
+                                </body>
+                                </html>
+                            """,
+                            mimeType: 'text/html',
+                            attachLog: true
+                        )
+                    }
+                }
+            }
         }
     }
 }
