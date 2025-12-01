@@ -207,23 +207,29 @@ stage('Dependency Check') {
             }
         }
 
-        stage('Run WebApp') {
-            steps {
-                sh '''
-                nohup java -jar target/*.jar > app.log 2>&1 &
-                for i in {1..30}; do
-                    if curl -s http://localhost:8083/  > /dev/null; then
-                        echo "Application is up!"
-                        exit 0
-                    fi
-                    echo "Waiting app to be ready..."
-                    sleep 2
-                done
-                echo "Application failed to start!"
-                exit 1
-                '''
-            }
-        }
+       stage('Run WebApp') {
+    steps {
+        sh '''
+        echo "Starting WebApp on port 8083..."
+        nohup java -jar target/*.jar --server.port=8083 > app.log 2>&1 &
+
+        for i in {1..30}; do
+            if curl -s http://localhost:8083/ > /dev/null; then
+                echo "Application is up!"
+                exit 0
+            fi
+            echo "Waiting app to be ready..."
+            sleep 2
+        done
+
+        echo "Application failed to start!"
+        echo "------ APP LOG ------"
+        cat app.log
+        exit 1
+        '''
+    }
+}
+
 
       stage('ZAP Scan') {
             steps {
