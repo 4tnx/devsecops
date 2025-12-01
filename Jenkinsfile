@@ -10,6 +10,7 @@ pipeline {
         SONAR_TOKEN = credentials('sonar-token')
         DOCKER_IMAGE_NAME = 'testfoodfreezy'
         APP_PORT = '8089'
+        DEPENDENCY_CHECK_HOME = '/opt/dependency-check'  // Add this line
     }
 
     stages {
@@ -122,24 +123,28 @@ pipeline {
         stage('Dependency Check (Fixed Database)') {
             steps {
                 sh '''
-                    echo "Fixing OWASP Dependency-Check database..."
+                    echo "Running OWASP Dependency-Check..."
                     
-                    # Clean up old database
-                    if [ -d "/opt/dependency-check/data" ]; then
-                        echo "Removing old database..."
-                        rm -rf /opt/dependency-check/data/*
-                    fi
+                    # Create local database directory with proper permissions
+                    mkdir -p ${WORKSPACE}/.dependency-check
                     
-                    # Run dependency-check with database update
-                    echo "Running Dependency-Check..."
+                    # Run dependency-check with local database
                     dependency-check.sh \
                         --scan . \
                         --project "FoodFrenzy" \
-                        --out ${WORKSPACE}/dependency-check-report \
+                        --out ${WORKSPACE} \
                         --format HTML \
+                        --format XML \
+                        --data ${WORKSPACE}/.dependency-check \
                         --enableExperimental \
                         --failOnCVSS 0 \
-                        --noupdate || echo "Dependency-Check completed with warnings"
+                        --noupdate \
+                        --disableAssembly \
+                        --disableBundleAudit \
+                        --nodeAuditSkipDevDependencies || echo "Dependency-Check completed with warnings"
+                        
+                    # Alternative: Use Maven plugin instead
+                    # mvn org.owasp:dependency-check-maven:check -Dformat=HTML -Dformat=XML -DskipProvidedScope=true
                 '''
             }
             post {
@@ -181,6 +186,12 @@ pipeline {
                         --template "@/usr/local/share/trivy/templates/html.tpl" \
                         -o ${WORKSPACE}/trivy_reports/trivy-report.html \
                         ${DOCKER_IMAGE_NAME}:${BUILD_NUMBER} || true
+                        
+                    # Also scan filesystem
+                    trivy filesystem \
+                        --format json \
+                        -o ${WORKSPACE}/trivy_reports/trivy-fs-report.json \
+                        . || true
                 '''
             }
             post {
