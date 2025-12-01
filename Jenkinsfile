@@ -14,7 +14,6 @@ pipeline {
 
     environment {
         SONAR_TOKEN = credentials('sonar-token')
-        NVD_API_KEY = credentials('8ee6ac6e-8bc-4163-889a-1245e99546c5')
         SLACK_WEBHOOK = credentials('slackcred')
     }
 
