@@ -47,34 +47,15 @@ pipeline {
 
         stage('SpotBugs Analysis') {
             steps {
-                sh '''
-                echo "Running SpotBugs analysis..."
-                mvn clean compile spotbugs:spotbugs || echo "SpotBugs analysis completed"
-                '''
-            }
-            post {
-                always {
-                    script {
-                        sh '''
-                        mkdir -p target/site 2>/dev/null || true
-                        '''
-                        if (fileExists('target/spotbugsXml.xml')) {
-                            archiveArtifacts artifacts: 'target/spotbugsXml.xml', allowEmptyArchive: true
-                        }
-                        if (fileExists('target/site/spotbugs.html')) {
-                            archiveArtifacts artifacts: 'target/site/spotbugs.html', allowEmptyArchive: true
-                        }
-                    }
-                }
+                sh 'mvn clean compile spotbugs:check || true'
+                archiveArtifacts artifacts: 'target/spotbugsXml.xml', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'target/site/spotbugs.html', allowEmptyArchive: true
             }
         }
 
         stage('Build + Test') {
             steps {
-                sh '''
-                echo "Building and running tests..."
-                mvn clean verify -DskipTests=false || echo "Tests completed with warnings"
-                '''
+                sh 'mvn clean verify -DskipTests=false'
             }
         }
 
@@ -228,7 +209,7 @@ EOF
             }
         }
 
-        stage('ZAP Scan') {
+       stage("ZAP Scan") {
             steps {
                 script {
                     sh "docker rm -f zap 2>/dev/null || true"
@@ -253,17 +234,15 @@ EOF
                     }
                 }
             }
+
             post {
                 always {
-                    script {
-                        if (fileExists('zap_reports/report.html')) {
-                            archiveArtifacts artifacts: 'zap_reports/report.html', allowEmptyArchive: true
-                        }
-                        sh 'docker rm -f zap 2>/dev/null || true'
-                    }
+                    archiveArtifacts artifacts: 'zap_reports/*.html', allowEmptyArchive: true
+                    sh "docker rm -f zap || true"
                 }
             }
         }
+
 
         stage('Sonar Analysis') {
             steps {
