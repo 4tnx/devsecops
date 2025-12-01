@@ -227,54 +227,30 @@ EOF
                 '''
             }
         }
-
         stage("ZAP Scan") {
             steps {
                 script {
-                    sh '''
-                    echo "Starting ZAP security scan..."
-                    mkdir -p ${WORKSPACE}/zap_reports
-                    
-                    # Clean up any existing ZAP container
-                    docker rm -f zap 2>/dev/null || true
-                    
-                    # Start ZAP container
-                    docker run -d --network host --name zap ghcr.io/zaproxy/zaproxy:stable sleep 3600
-                    sleep 10  # Wait for container to initialize
-                    
-                    # Wait for ZAP to be ready
-                    for i in {1..10}; do
-                        if docker exec zap curl -s http://localhost:8080/ > /dev/null 2>&1; then
-                            echo "ZAP container is ready"
-                            break
-                        fi
-                        echo "Waiting for ZAP container... ($i/10)"
-                        sleep 5
-                    done
-                    
-                    # Run ZAP scan with proper timeout and options
-                    echo "Running ZAP full scan..."
-                    docker exec zap zap-full-scan.py \
-                        -t http://localhost:8080 \
-                        -T 120 \
-                        -m 10 \
-                        -r /zap/report.html \
-                        -x /zap/report.xml \
-                        --hook=/zap/auth_hook.py \
-                        || echo "ZAP scan completed with exit code: $?"
-                    
-                    # Wait a moment for report generation
-                    sleep 5
-                    
-                    # Copy reports from container
-                    docker cp zap:/zap/report.html ${WORKSPACE}/zap_reports/report.html 2>/dev/null || echo "Failed to copy HTML report"
-                    docker cp zap:/zap/report.xml ${WORKSPACE}/zap_reports/report.xml 2>/dev/null || echo "Failed to copy XML report"
-                    
-                    # Stop the application
-                    lsof -ti:8080 | xargs kill -9 2>/dev/null || true
-                    '''
+                    sh "docker rm -f zap 2>/dev/null || true"
+
+                    sh """
+                        docker run -d --network host --name zap ghcr.io/zaproxy/zaproxy:stable sleep infinity
+                    """
+                    sh "docker exec zap mkdir -p /zap/wrk"
+
+                    def zapExit = sh(
+                        script: "docker exec zap zap-full-scan.py -t http://localhost:8080 -r /zap/report.html",
+                        returnStatus: true
+                    )
+
+                    sh "mkdir -p ${WORKSPACE}/zap_reports"
+                    sh "docker cp zap:/zap/report.html ${WORKSPACE}/zap_reports/report.html"
+
+                    echo "ZAP scan finished with exit code: ${zapExit}"
+
+                    if (zapExit == 1 || zapExit == 3) {
+                        error "ZAP scan failed"
+                    }
                 }
-            }
             post {
                 always {
                     script {
@@ -289,24 +265,8 @@ EOF
 
         stage('Sonar Analysis') {
             steps {
-                script {
-                    withSonarQubeEnv('SonarQubeServer') {
-                        sh '''
-                        echo "Running SonarQube analysis..."
-                        mvn sonar:sonar \
-                            -Dsonar.projectKey=devops_java \
-                            -Dsonar.host.url=http://192.168.50.4:9000 \
-                            -Dsonar.login=${SONAR_TOKEN} \
-                            -Dsonar.sources=src \
-                            -Dsonar.tests=src/test \
-                            -Dsonar.java.binaries=target/classes \
-                            -Dsonar.junit.reportPaths=target/surefire-reports \
-                            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
-                            -Dsonar.dependencyCheck.htmlReportPath=dependency-check-report.html \
-                            -Dsonar.dependencyCheck.jsonReportPath=dependency-check-report.json \
-                            || echo "SonarQube analysis completed with warnings"
-                        '''
-                    }
+                withSonarQubeEnv('SonarQubeServer') {
+                    sh "mvn sonar:sonar -Dsonar.projectKey=devops_java -Dsonar.host.url=http://192.168.50.4:9000 -Dsonar.login=${SONAR_TOKEN}"
                 }
             }
         }
@@ -322,123 +282,54 @@ EOF
         }
     }
 
-    post {
+     post {
         always {
             script {
                 def buildStatus = currentBuild.currentResult
-                def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'Triggered by SCM'
+                def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub User'
                 def buildUrl = "${env.BUILD_URL}"
-                
-                // Clean up any running processes
+
                 sh '''
-                echo "Cleaning up processes..."
-                lsof -ti:8080 | xargs kill -9 2>/dev/null || true
-                docker rm -f zap 2>/dev/null || true
+                    mkdir -p reports
+                    cp semgrep-report.json reports/ 2>/dev/null || true
+                    cp target/spotbugsXml.xml reports/ 2>/dev/null || true
+                    cp target/site/spotbugs.html reports/ 2>/dev/null || true
+                    cp dependency-check-report.html reports/ 2>/dev/null || true
+                    cp secrets_reports/*.json reports/ 2>/dev/null || true
+                    cp zap_reports/*.html reports/ 2>/dev/null || true
+                    cp trivy_reports/*.html reports/ 2>/dev/null || true
                 '''
-                
-                // Collect all reports
+
+                sh 'echo "--- Reports Collected ---" && ls -la reports || true'
+
                 sh '''
-                echo "Collecting all security reports..."
-                mkdir -p reports
-                
-                # Copy reports with individual checks
-                [ -f semgrep-report.json ] && cp semgrep-report.json reports/ || echo "Semgrep report not found"
-                [ -f target/spotbugsXml.xml ] && cp target/spotbugsXml.xml reports/ 2>/dev/null || echo "Spotbugs XML not found"
-                [ -f target/site/spotbugs.html ] && cp target/site/spotbugs.html reports/ 2>/dev/null || echo "Spotbugs HTML not found"
-                [ -f dependency-check-report.html ] && cp dependency-check-report.html reports/ || echo "Dependency check report not found"
-                [ -f dependency-check-report.json ] && cp dependency-check-report.json reports/ 2>/dev/null || echo "Dependency check JSON not found"
-                [ -f secrets_reports/gitleaks-report.json ] && cp secrets_reports/gitleaks-report.json reports/ 2>/dev/null || echo "Gitleaks report not found"
-                [ -f zap_reports/report.html ] && cp zap_reports/report.html reports/ 2>/dev/null || echo "ZAP report not found"
-                [ -f zap_reports/report.xml ] && cp zap_reports/report.xml reports/ 2>/dev/null || echo "ZAP XML report not found"
-                [ -f trivy_reports/trivy-report.html ] && cp trivy_reports/trivy-report.html reports/ 2>/dev/null || echo "Trivy HTML report not found"
-                [ -f trivy_reports/trivy-report.json ] && cp trivy_reports/trivy-report.json reports/ 2>/dev/null || echo "Trivy JSON report not found"
-                [ -f app.log ] && cp app.log reports/ 2>/dev/null || echo "Application log not found"
-                
-                echo "=== Reports Collected ==="
-                ls -la reports/ 2>/dev/null || echo "No reports directory created"
-                echo ""
-                
-                # Create archive
-                if command -v zip >/dev/null 2>&1; then
-                    echo "Creating ZIP archive..."
-                    zip -r reports.zip reports/ 2>/dev/null || echo "Failed to create ZIP"
-                else
-                    echo "Creating TAR archive..."
-                    tar -czf reports.tar.gz reports/ 2>/dev/null || echo "Failed to create TAR"
-                fi
+                    if command -v zip >/dev/null 2>&1; then
+                        zip -r reports.zip reports/
+                    else
+                        tar -czf reports.tar.gz reports/
+                    fi
                 '''
-                
-                // Send email notification
+
                 emailext(
                     to: 'mekni.amin75@gmail.com',
                     subject: "📊 Security Pipeline ${buildStatus} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                     body: """
-                        <html>
-                        <body style="font-family: Arial, sans-serif; line-height: 1.6;">
-                            <h2>Security Pipeline Report</h2>
-                            <p>Hello,</p>
-                            <p>The security pipeline has completed with status: <strong>${buildStatus}</strong>.</p>
-                            
-                            <h3>Build Details</h3>
-                            <ul>
-                                <li><strong>Project:</strong> ${env.JOB_NAME}</li>
-                                <li><strong>Build Number:</strong> ${env.BUILD_NUMBER}</li>
-                                <li><strong>Triggered by:</strong> ${buildUser}</li>
-                                <li><strong>Jenkins Build URL:</strong> <a href="${buildUrl}">${buildUrl}</a></li>
-                                <li><strong>Duration:</strong> ${currentBuild.durationString}</li>
-                            </ul>
-                            
-                            <h3>Security Tools Executed</h3>
-                            <ul>
-                                <li>✓ Semgrep SAST Analysis</li>
-                                <li>✓ SpotBugs Static Analysis</li>
-                                <li>✓ OWASP Dependency Check</li>
-                                <li>✓ Trivy Container Scanning</li>
-                                <li>✓ Gitleaks Secrets Detection</li>
-                                <li>✓ OWASP ZAP Dynamic Analysis</li>
-                                <li>✓ SonarQube Quality Gate</li>
-                            </ul>
-                            
-                            <p>All generated reports are attached to this email.</p>
-                            
-                            <hr>
-                            <p style="color: #666; font-size: 12px;">
-                                This is an automated message from Jenkins CI/CD Security Pipeline.<br>
-                                Please review the attached reports for detailed findings.
-                            </p>
-                        </body>
-                        </html>
+                        <p>Hello,</p>
+                        <p>The security pipeline has completed with status: <b>${buildStatus}</b>.</p>
+                        <ul>
+                            <li><b>Project:</b> ${env.JOB_NAME}</li>
+                            <li><b>Build Number:</b> ${env.BUILD_NUMBER}</li>
+                            <li><b>Triggered by:</b> ${buildUser}</li>
+                            <li><b>Jenkins Build URL:</b> <a href="${buildUrl}">${buildUrl}</a></li>
+                        </ul>
+                        <p>All generated reports (Semgrep, SpotBugs, Dependency-Check, Secrets, Trivy, and ZAP) are attached.</p>
+                        <hr>
+                        <p>— Jenkins CI/CD Security Pipeline</p>
                     """,
                     mimeType: 'text/html',
-                    attachmentsPattern: 'reports.zip,reports.tar.gz',
+                    attachmentsPattern: 'reports/**',
                     attachLog: true
                 )
-                
-                // Clean up
-                sh '''
-                echo "Final cleanup..."
-                docker system prune -f 2>/dev/null || true
-                '''
-            }
-        }
-        
-        failure {
-            script {
-                echo "Pipeline failed. Check logs for details."
-                // Send failure notification if needed
-                emailext(
-                    to: 'mekni.amin75@gmail.com',
-                    subject: "❌ Pipeline FAILED - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                    body: "The Jenkins pipeline has failed. Please check the build logs.",
-                    attachLog: true
-                )
-            }
-        }
-        
-        success {
-            script {
-                echo "Pipeline succeeded!"
-                // Additional success actions if needed
             }
         }
     }
