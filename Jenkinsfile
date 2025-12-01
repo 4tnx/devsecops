@@ -210,53 +210,21 @@ EOF
             }
         }
 
-        stage('Run WebApp') {
+       stage('Run WebApp') {
             steps {
-                script {
-                    sh '''
-                    echo "Starting the web application..."
-                    # Kill any existing process on port 8080
-                    lsof -ti:8080 | xargs kill -9 2>/dev/null || true
-                    
-                    # Start the application in background
-                    nohup java -jar target/*.jar > app.log 2>&1 &
-                    
-                    APP_PID=$!
-                    echo "Application started with PID: $APP_PID"
-                    
-                    # Wait for application to be ready
-                    MAX_WAIT=60
-                    WAIT_COUNT=0
-                    
-                    while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
-                        if curl -s -f http://localhost:8080/ > /dev/null 2>&1; then
-                            echo "✓ Application is up and running!"
-                            echo "Application logs (last 20 lines):"
-                            tail -20 app.log
-                            break
-                        fi
-                        
-                        # Check if process is still running
-                        if ! ps -p $APP_PID > /dev/null 2>&1; then
-                            echo "✗ Application process died!"
-                            echo "Application logs:"
-                            cat app.log
-                            exit 1
-                        fi
-                        
-                        echo "Waiting for application to be ready... ($((WAIT_COUNT+1))/$MAX_WAIT)"
-                        sleep 5
-                        WAIT_COUNT=$((WAIT_COUNT + 1))
-                    done
-                    
-                    if [ $WAIT_COUNT -ge $MAX_WAIT ]; then
-                        echo "✗ Application failed to start within timeout!"
-                        echo "Application logs:"
-                        cat app.log
-                        exit 1
+                sh '''
+                nohup java -jar target/*.jar > app.log 2>&1 &
+                for i in {1..30}; do
+                    if curl -s http://localhost:8080/  > /dev/null; then
+                        echo "Application is up!"
+                        exit 0
                     fi
-                    '''
-                }
+                    echo "Waiting app to be ready..."
+                    sleep 2
+                done
+                echo "Application failed to start!"
+                exit 1
+                '''
             }
         }
 
