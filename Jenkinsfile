@@ -8,406 +8,225 @@ pipeline {
 
     environment {
         SONAR_TOKEN = credentials('sonar-token')
-        DOCKER_IMAGE_NAME = 'testfoodfreezy'
-        APP_PORT = '8089'
-        DEPENDENCY_CHECK_HOME = '/opt/dependency-check'  // Add this line
     }
 
     stages {
-        stage('Cleanup Workspace') {
-            steps {
-                deleteDir()
-                
-                // Clean Docker containers and images
-                sh '''
-                    echo "Cleaning up Docker containers..."
-                    docker rm -f test-app 2>/dev/null || true
-                    docker rm -f zap-container 2>/dev/null || true
-                    docker system prune -f 2>/dev/null || true
-                '''
-                
-                // Kill process on APP_PORT
-                sh '''
-                    echo "Checking for processes on port ${APP_PORT}..."
-                    lsof -ti:${APP_PORT} | xargs kill -9 2>/dev/null || true
-                    sleep 2
-                '''
-            }
-        }
 
         stage('Checkout') {
             steps {
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: 'main']],
-                    userRemoteConfigs: [[
-                        url: 'https://github.com/4tnx/devsecops',
-                        credentialsId: '' 
-                    ]]
+                deleteDir()
+                checkout([$class: 'GitSCM',
+                          branches: [[name: 'main']],
+                          userRemoteConfigs: [[url: 'https://github.com/4tnx/devsecops']]
                 ])
-            }
-        }
-
-        stage('Initialize Workspace') {
-            steps {
-                sh '''
-                    echo "=== Initializing Workspace ==="
-                    echo "Java version:"
-                    java -version
-                    echo "Maven version:"
-                    mvn --version
-                    echo "Docker version:"
-                    docker --version
-                    echo "=== End Initialization ==="
-                '''
-            }
-        }
-
-        stage('Compile & Build') {
-            steps {
-                sh '''
-                    echo "Compiling project..."
-                    mvn -B clean compile
-                    
-                    echo "Building JAR..."
-                    mvn -B -DskipTests package
-                '''
-            }
-        }
-
-        stage('Spotbugs Analysis') {
-            steps {
-                sh "mvn -B spotbugs:spotbugs"
-            }
-            post {
-                always {
-                    sh '''
-                        echo "Collecting SpotBugs reports..."
-                        mkdir -p ${WORKSPACE}/reports
-                        cp target/spotbugs.xml ${WORKSPACE}/reports/ 2>/dev/null || echo "No spotbugs.xml found"
-                        cp target/site/spotbugs.html ${WORKSPACE}/reports/ 2>/dev/null || echo "No spotbugs.html found"
-                        
-                        # Generate basic report if none exists
-                        if [ ! -f "${WORKSPACE}/reports/spotbugs.html" ]; then
-                            echo '<h1>SpotBugs Report</h1><p>No issues found or report not generated.</p>' > ${WORKSPACE}/reports/spotbugs.html
-                        fi
-                    '''
-                }
             }
         }
 
         stage('Semgrep SAST') {
             steps {
                 sh '''
-                    echo "Running Semgrep SAST..."
-                    docker run --rm \
-                        -v ${WORKSPACE}:/src \
-                        returntocorp/semgrep:latest \
-                        semgrep scan \
-                        --config=auto \
-                        --json \
-                        --output=/src/semgrep-report.json \
-                        /src || true
+                echo "Running Semgrep…"
+                docker run --rm -v $PWD:/src returntocorp/semgrep \
+                    semgrep --config=p/owasp-top-ten /src > semgrep-report.json
                 '''
+                archiveArtifacts artifacts: 'semgrep-report.json', allowEmptyArchive: true
             }
-            post {
-                always {
-                    sh '''
-                        cp semgrep-report.json ${WORKSPACE}/reports/ 2>/dev/null || \
-                            echo '{"results": []}' > ${WORKSPACE}/reports/semgrep-report.json
-                    '''
-                }
+
+        }
+
+        stage('SpotBugs Analysis') {
+            steps {
+                sh 'mvn clean compile spotbugs:check || true'
+                archiveArtifacts artifacts: 'target/spotbugsXml.xml', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'target/site/spotbugs.html', allowEmptyArchive: true
             }
         }
 
-        stage('Dependency Check (Fixed Database)') {
+        stage('Build + Test') {
+            steps {
+                sh 'mvn clean verify -DskipTests=false'
+            }
+        }
+
+        stage('Verify Workspace') {
             steps {
                 sh '''
-                    echo "Running OWASP Dependency-Check..."
-                    
-                    # Create local database directory with proper permissions
-                    mkdir -p ${WORKSPACE}/.dependency-check
-                    
-                    # Run dependency-check with local database
-                    dependency-check.sh \
-                        --scan . \
-                        --project "FoodFrenzy" \
-                        --out ${WORKSPACE} \
-                        --format HTML \
-                        --format XML \
-                        --data ${WORKSPACE}/.dependency-check \
-                        --enableExperimental \
-                        --failOnCVSS 0 \
-                        --disableAssembly \
-                        --disableBundleAudit \
-                        --nodeAuditSkipDevDependencies || echo "Dependency-Check completed with warnings"
-                        
-                    # Alternative: Use Maven plugin instead
-                    # mvn org.owasp:dependency-check-maven:check -Dformat=HTML -Dformat=XML -DskipProvidedScope=true
+                    echo "Current directory: $(pwd)"
+                    echo "Files in workspace:"
+                    ls -la
                 '''
-            }
-            post {
-                always {
-                    sh '''
-                        echo "Collecting Dependency-Check reports..."
-                        cp dependency-check-report.html ${WORKSPACE}/reports/ 2>/dev/null || true
-                        cp dependency-check-report.xml ${WORKSPACE}/reports/ 2>/dev/null || true
-                        
-                        # Generate basic report if none exists
-                        if [ ! -f "${WORKSPACE}/reports/dependency-check-report.html" ]; then
-                            echo '<h1>Dependency-Check Report</h1><p>Report generation failed. Check database configuration.</p>' > ${WORKSPACE}/reports/dependency-check-report.html
-                        fi
-                    '''
-                }
             }
         }
 
         stage('Build Docker Image') {
             steps {
-                sh '''
-                    echo "Building Docker image..."
-                    docker build -t ${DOCKER_IMAGE_NAME}:${BUILD_NUMBER} .
-                    docker tag ${DOCKER_IMAGE_NAME}:${BUILD_NUMBER} ${DOCKER_IMAGE_NAME}:latest
-                '''
+                sh 'docker build -f $WORKSPACE/Dockerfile -t testfoodfreezy $WORKSPACE'
             }
         }
 
         stage('Trivy Scan') {
             steps {
                 sh '''
-                    echo "Running Trivy vulnerability scan..."
-                    mkdir -p ${WORKSPACE}/trivy_reports
-                    
-                    # Scan the Docker image
-                    trivy image \
-                        --timeout 15m \
-                        --format template \
-                        --template "@/usr/local/share/trivy/templates/html.tpl" \
-                        -o ${WORKSPACE}/trivy_reports/trivy-report.html \
-                        ${DOCKER_IMAGE_NAME}:${BUILD_NUMBER} || true
-                        
-                    # Also scan filesystem
-                    trivy filesystem \
-                        --format json \
-                        -o ${WORKSPACE}/trivy_reports/trivy-fs-report.json \
-                        . || true
+                echo "Running Trivy vulnerability scan..."
+                mkdir -p trivy_reports
+                trivy image --format template --template "@/usr/local/share/trivy/templates/html.tpl" -o trivy_reports/trivy-report.html testfoodfreezy || true
                 '''
             }
             post {
                 always {
-                    sh '''
-                        cp trivy_reports/trivy-report.html ${WORKSPACE}/reports/ 2>/dev/null || \
-                            echo '<h1>Trivy Report</h1><p>Scan failed or no vulnerabilities found.</p>' > ${WORKSPACE}/reports/trivy-report.html
-                    '''
+                    archiveArtifacts artifacts: 'trivy_reports/*.html', allowEmptyArchive: true
                 }
             }
+        }
+
+        stage('OWASP Dependency-Check Vulnerabilities') {
+          steps {
+            dependencyCheck additionalArguments: '''
+                --scan "./target"
+                --enableExperimental
+                -f "ALL"
+                --prettyPrint
+            ''', odcInstallation: 'DP-Check'
+            dependencyCheckPublisher pattern: 'dependency-check-report.xml'
+            archiveArtifacts artifacts: 'dependency-check-report.html', allowEmptyArchive: true
+          }
         }
 
         stage('Secrets Scan - Gitleaks') {
             steps {
-                sh '''
-                    echo "Running Gitleaks secrets scan..."
-                    mkdir -p ${WORKSPACE}/secrets_reports
-                    
-                    docker run --rm \
-                        -v ${WORKSPACE}:/code \
-                        zricethezav/gitleaks:latest \
-                        detect \
+                script {
+                    sh "mkdir -p ${WORKSPACE}/secrets_reports"
+
+                    sh """
+                    docker run --rm -v ${WORKSPACE}:/code zricethezav/gitleaks:latest detect \
                         --source=/code \
                         --report-format=json \
-                        --report-path=/code/secrets_reports/gitleaks-report.json \
-                        --verbose || echo "Gitleaks scan completed"
-                '''
-            }
-            post {
-                always {
-                    sh '''
-                        cp secrets_reports/gitleaks-report.json ${WORKSPACE}/reports/ 2>/dev/null || \
-                            echo '{"Findings": []}' > ${WORKSPACE}/reports/gitleaks-report.json
-                    '''
-                }
-            }
-        }
-
-        stage('Run WebApp in Container') {
-            steps {
-                sh '''
-                    echo "Starting application on port ${APP_PORT}..."
-                    
-                    # Clean up any existing container
-                    docker rm -f test-app 2>/dev/null || true
-                    
-                    # Run the application in Docker container
-                    docker run -d \
-                        --name test-app \
-                        --network=host \
-                        -p ${APP_PORT}:${APP_PORT} \
-                        -e SERVER_PORT=${APP_PORT} \
-                        ${DOCKER_IMAGE_NAME}:${BUILD_NUMBER}
-                    
-                    echo "Waiting for application to start..."
-                    
-                    # Wait for application to be ready
-                    MAX_WAIT=60
-                    WAIT_COUNT=0
-                    while [ ${WAIT_COUNT} -lt ${MAX_WAIT} ]; do
-                        if curl -s -f http://localhost:${APP_PORT}/actuator/health > /dev/null 2>&1 || \
-                           curl -s -f http://localhost:${APP_PORT}/ > /dev/null 2>&1; then
-                            echo "Application is up and running!"
-                            break
-                        fi
-                        
-                        echo "Waiting for application... (${WAIT_COUNT}/${MAX_WAIT})"
-                        WAIT_COUNT=$((WAIT_COUNT + 1))
-                        sleep 2
-                        
-                        # Check if container is still running
-                        if ! docker ps | grep -q test-app; then
-                            echo "Container stopped unexpectedly!"
-                            docker logs test-app || true
-                            exit 1
-                        fi
-                    done
-                    
-                    if [ ${WAIT_COUNT} -ge ${MAX_WAIT} ]; then
-                        echo "ERROR: Application failed to start within ${MAX_WAIT} seconds"
-                        docker logs test-app || true
-                        exit 1
-                    fi
-                '''
-            }
-        }
-
-        stage('ZAP Scan') {
-            steps {
-                sh '''
-                    echo "Starting ZAP scan..."
-                    mkdir -p ${WORKSPACE}/zap_reports
-                    
-                    # Run ZAP passive scan
-                    docker run --rm \
-                        -v ${WORKSPACE}/zap_reports:/zap/wrk \
-                        -u zap \
-                        --network=host \
-                        owasp/zap2docker-stable \
-                        zap-baseline.py \
-                        -t http://localhost:${APP_PORT} \
-                        -r report.html \
-                        -m 5 \
-                        -l PASSIVE || echo "ZAP scan completed with warnings"
-                '''
-            }
-            post {
-                always {
-                    sh '''
-                        echo "Collecting ZAP reports..."
-                        cp zap_reports/report.html ${WORKSPACE}/reports/ 2>/dev/null || \
-                            echo '<h1>ZAP Report</h1><p>ZAP scan failed or no issues found.</p>' > ${WORKSPACE}/reports/zap-report.html
-                    '''
-                    
-                    // Stop the test application
-                    sh 'docker rm -f test-app 2>/dev/null || true'
-                }
-            }
-        }
-
-        stage('SonarQube Analysis') {
-            steps {
-                withSonarQubeEnv('sonar-server') {
-                    sh """
-                        mvn -B sonar:sonar \
-                            -Dsonar.projectKey=FoodFrenzy \
-                            -Dsonar.projectName='FoodFrenzy' \
-                            -Dsonar.host.url=\${SONAR_HOST_URL} \
-                            -Dsonar.token=\${SONAR_TOKEN} \
-                            -Dsonar.java.binaries=target/classes \
-                            -Dsonar.sources=src/main/java \
-                            -Dsonar.tests=src/test/java \
-                            -Dsonar.junit.reportsPath=target/surefire-reports \
-                            -Dsonar.jacoco.reportPath=target/jacoco.exec
+                        --report-path=/code/secrets_reports/gitleaks-report.json
                     """
+                }
+                archiveArtifacts artifacts: 'secrets_reports/*.json'
+            }
+        }
+
+        stage('Run WebApp') {
+            steps {
+                sh '''
+                nohup java -jar target/*.jar > app.log 2>&1 &
+                for i in {1..30}; do
+                    if curl -s http://localhost:8089/  > /dev/null; then
+                        echo "Application is up!"
+                        exit 0
+                    fi
+                    echo "Waiting app to be ready..."
+                    sleep 2
+                done
+                echo "Application failed to start!"
+                exit 1
+                '''
+            }
+        }
+
+        stage("ZAP Scan") {
+            steps {
+                script {
+                    sh "docker rm -f zap 2>/dev/null || true"
+
+                    sh """
+                        docker run -d --network host --name zap ghcr.io/zaproxy/zaproxy:stable sleep infinity
+                    """
+                    sh "docker exec zap mkdir -p /zap/wrk"
+
+                    def zapExit = sh(
+                        script: "docker exec zap zap-full-scan.py -t http://localhost:8089 -r /zap/report.html",
+                        returnStatus: true
+                    )
+
+                    sh "mkdir -p ${WORKSPACE}/zap_reports"
+                    sh "docker cp zap:/zap/report.html ${WORKSPACE}/zap_reports/report.html"
+
+                    echo "ZAP scan finished with exit code: ${zapExit}"
+
+                    if (zapExit == 1 || zapExit == 3) {
+                        error "ZAP scan failed"
+                    }
+                }
+            }
+
+            post {
+                always {
+                    archiveArtifacts artifacts: 'zap_reports/*.html', allowEmptyArchive: true
+                    sh "docker rm -f zap || true"
+                }
+            }
+        }
+
+        stage('Sonar Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQubeServer') {
+                    sh "mvn sonar:sonar -Dsonar.projectKey=devops_java -Dsonar.host.url=http://192.168.50.4:9000 -Dsonar.login=${SONAR_TOKEN}"
                 }
             }
         }
 
         stage('Quality Gate') {
             steps {
-                timeout(time: 5, unit: 'MINUTES') {
+                timeout(time: 1, unit: 'MINUTES') {
                     waitForQualityGate abortPipeline: false
                 }
             }
         }
+
     }
 
     post {
         always {
             script {
-                echo "Pipeline completed with status: ${currentBuild.currentResult}"
-                
-                // Final cleanup
+                def buildStatus = currentBuild.currentResult
+                def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub User'
+                def buildUrl = "${env.BUILD_URL}"
+
                 sh '''
-                    echo "Performing final cleanup..."
-                    docker rm -f test-app 2>/dev/null || true
-                    docker rmi ${DOCKER_IMAGE_NAME}:${BUILD_NUMBER} 2>/dev/null || true
-                    
-                    # List collected reports
-                    echo "=== Collected Reports ==="
-                    ls -la ${WORKSPACE}/reports/ 2>/dev/null || echo "No reports directory"
+                    mkdir -p reports
+                    cp semgrep-report.json reports/ 2>/dev/null || true
+                    cp target/spotbugsXml.xml reports/ 2>/dev/null || true
+                    cp target/site/spotbugs.html reports/ 2>/dev/null || true
+                    cp dependency-check-report.html reports/ 2>/dev/null || true
+                    cp secrets_reports/*.json reports/ 2>/dev/null || true
+                    cp zap_reports/*.html reports/ 2>/dev/null || true
+                    cp trivy_reports/*.html reports/ 2>/dev/null || true
                 '''
-                
-                // Archive all reports
-                archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
-                
-                // Create consolidated report zip
+
+                sh 'echo "--- Reports Collected ---" && ls -la reports || true'
+
                 sh '''
-                    mkdir -p ${WORKSPACE}/artifacts
-                    if [ -d "${WORKSPACE}/reports" ]; then
-                        cd ${WORKSPACE}/reports
-                        zip -r ${WORKSPACE}/artifacts/security-reports.zip .
+                    if command -v zip >/dev/null 2>&1; then
+                        zip -r reports.zip reports/
+                    else
+                        tar -czf reports.tar.gz reports/
                     fi
                 '''
-                
-                // Archive the zip
-                archiveArtifacts artifacts: 'artifacts/security-reports.zip', allowEmptyArchive: true
-                
-                // Send email notification
+
                 emailext(
                     to: 'mekni.amin75@gmail.com',
-                    subject: "🔒 Security Scan ${currentBuild.currentResult} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    subject: "📊 Security Pipeline ${buildStatus} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
                     body: """
-                        <h2>Security Pipeline Results</h2>
-                        <p><strong>Status:</strong> ${currentBuild.currentResult}</p>
-                        <p><strong>Project:</strong> ${env.JOB_NAME}</p>
-                        <p><strong>Build:</strong> #${env.BUILD_NUMBER}</p>
-                        <p><strong>Build URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
-                        
-                        <h3>Summary:</h3>
+                        <p>Hello,</p>
+                        <p>The security pipeline has completed with status: <b>${buildStatus}</b>.</p>
                         <ul>
-                            <li>SAST Scan (Semgrep): Completed</li>
-                            <li>Static Analysis (SpotBugs): Completed</li>
-                            <li>Dependency Check: Completed</li>
-                            <li>Container Scan (Trivy): Completed</li>
-                            <li>Secrets Scan (Gitleaks): Completed</li>
-                            <li>DAST Scan (ZAP): Completed</li>
-                            <li>SonarQube Analysis: ${currentBuild.currentResult == 'SUCCESS' ? 'Completed' : 'Skipped/Failed'}</li>
+                            <li><b>Project:</b> ${env.JOB_NAME}</li>
+                            <li><b>Build Number:</b> ${env.BUILD_NUMBER}</li>
+                            <li><b>Triggered by:</b> ${buildUser}</li>
+                            <li><b>Jenkins Build URL:</b> <a href="${buildUrl}">${buildUrl}</a></li>
                         </ul>
-                        
-                        <p>All security reports are attached to this email.</p>
+                        <p>All generated reports (Semgrep, SpotBugs, Dependency-Check, Secrets, Trivy, and ZAP) are attached.</p>
                         <hr>
-                        <p><em>Jenkins Security Pipeline</em></p>
+                        <p>— Jenkins CI/CD Security Pipeline</p>
                     """,
                     mimeType: 'text/html',
-                    attachmentsPattern: 'artifacts/security-reports.zip',
+                    attachmentsPattern: 'reports/**',
                     attachLog: true
                 )
             }
-        }
-        
-        cleanup {
-            sh '''
-                echo "Cleaning up workspace..."
-                docker system prune -f 2>/dev/null || true
-            '''
         }
     }
 }
