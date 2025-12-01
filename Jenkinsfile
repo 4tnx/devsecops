@@ -138,7 +138,6 @@ pipeline {
                         --data ${WORKSPACE}/.dependency-check \
                         --enableExperimental \
                         --failOnCVSS 0 \
-                        --noupdate \
                         --disableAssembly \
                         --disableBundleAudit \
                         --nodeAuditSkipDevDependencies || echo "Dependency-Check completed with warnings"
