@@ -8,7 +8,7 @@ pipeline {
 
     environment {
         SONAR_TOKEN = credentials('sonar-token')
-        NVD_API_KEY = credentials('NVD_API_KEY')
+        NVD_API_KEY = credentials('8ee6ac6e-8bc0-4163-889a-1245e99546c5')
     }
 
     stages {
