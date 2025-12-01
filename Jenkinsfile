@@ -1,5 +1,3 @@
-
-
 pipeline {
 
     agent {
@@ -18,7 +16,6 @@ pipeline {
         SONAR_TOKEN = credentials('sonar-token')
         NVD_API_KEY = credentials('8ee6ac6e-8bc-4163-889a-1245e99546c5')
         SLACK_WEBHOOK = credentials('slackcred')
-
     }
 
     stages {
@@ -181,75 +178,80 @@ pipeline {
                 }
             }
         }
+
+        stage('Post Build Actions') {
+            steps {
+                script {
+                    // --- Collect all reports ---
+                    sh '''
+                        mkdir -p all_reports
+                        cp semgrep-report.json all_reports/ 2>/dev/null || true
+                        cp target/spotbugsXml.xml all_reports/ 2>/dev/null || true
+                        cp target/site/spotbugs.html all_reports/ 2>/dev/null || true
+                        cp dependency-check-report.* all_reports/ 2>/dev/null || true
+                        cp secrets_reports/* all_reports/ 2>/dev/null || true
+                        cp trivy_reports/* all_reports/ 2>/dev/null || true
+                        cp zap_reports/* all_reports/ 2>/dev/null || true
+                        cp app.log all_reports/ 2>/dev/null || true
+                    '''
+
+                    archiveArtifacts artifacts: 'all_reports/**', allowEmptyArchive: true
+
+                    // Slack notification
+                    sh """
+                    curl -X POST -H 'Content-type: application/json' \
+                    --data '{"text": "🔔 Jenkins Build ${currentBuild.currentResult}: ${env.JOB_NAME} #${env.BUILD_NUMBER}"}' \
+                    $SLACK_WEBHOOK
+                    """
+                }
+            }
+        }
     }
 
     post {
         always {
-
-            // --- Collect all reports ---
-            sh '''
-                mkdir -p all_reports
-                cp semgrep-report.json all_reports/ 2>/dev/null || true
-                cp target/spotbugsXml.xml all_reports/ 2>/dev/null || true
-                cp target/site/spotbugs.html all_reports/ 2>/dev/null || true
-                cp dependency-check-report.* all_reports/ 2>/dev/null || true
-                cp secrets_reports/* all_reports/ 2>/dev/null || true
-                cp trivy_reports/* all_reports/ 2>/dev/null || true
-                cp zap_reports/* all_reports/ 2>/dev/null || true
-            '''
-
-            archiveArtifacts artifacts: 'all_reports/**', allowEmptyArchive: true
-
-            // Slack notification
-            sh """
-            curl -X POST -H 'Content-type: application/json' \
-            --data '{"text": "🔔 Jenkins Build ${currentBuild.currentResult}: ${env.JOB_NAME} #${env.BUILD_NUMBER}"}' \
-            $SLACK_WEBHOOK
-            """
-
             emailext(
-    to: 'mekni.amin75@gmail.com',
-    subject: "📌 Jenkins Security Pipeline - ${currentBuild.currentResult} | ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-    body: """
-        <html>
-        <body>
-            <h2>🔐 DevSecOps Pipeline Report</h2>
-            <p>Hello,</p>
-
-            <p>The pipeline has completed with the following details:</p>
-
-            <ul>
-                <li><b>Status:</b> ${currentBuild.currentResult}</li>
-                <li><b>Project:</b> ${env.JOB_NAME}</li>
-                <li><b>Build Number:</b> ${env.BUILD_NUMBER}</li>
-                <li><b>Branch:</b> ${env.GIT_BRANCH}</li>
-                <li><b>Triggered By:</b> ${currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub Trigger'}</li>
-                <li><b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></li>
-            </ul>
-
-            <hr>
-            <h3>📄 Reports Included</h3>
-            <ul>
-                <li>Semgrep SAST</li>
-                <li>SpotBugs</li>
-                <li>OWASP Dependency Check</li>
-                <li>Gitleaks Secrets Scan</li>
-                <li>Trivy Container Scan</li>
-                <li>ZAP DAST Scan</li>
-            </ul>
-
-            <p>All reports are attached to this email.</p>
-            <hr>
-
-            <p style="font-size:12px;color:#777;">✔ Automated by Jenkins DevSecOps Pipeline</p>
-        </body>
-        </html>
-    """,
-    mimeType: 'text/html',
-    attachmentsPattern: 'all_reports/**, app.log',
-    attachLog: true
-)
-
+                to: 'mekni.amin75@gmail.com',
+                subject: "📌 Jenkins Security Pipeline - ${currentBuild.currentResult} | ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    <html>
+                    <body>
+                        <h2>🔐 DevSecOps Pipeline Report</h2>
+                        <p>Hello,</p>
+                        
+                        <p>The pipeline has completed with the following details:</p>
+                        
+                        <ul>
+                            <li><b>Status:</b> ${currentBuild.currentResult}</li>
+                            <li><b>Project:</b> ${env.JOB_NAME}</li>
+                            <li><b>Build Number:</b> ${env.BUILD_NUMBER}</li>
+                            <li><b>Branch:</b> ${env.GIT_BRANCH}</li>
+                            <li><b>Triggered By:</b> ${currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub Trigger'}</li>
+                            <li><b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></li>
+                        </ul>
+                        
+                        <hr>
+                        <h3>📄 Reports Included</h3>
+                        <ul>
+                            <li>Semgrep SAST</li>
+                            <li>SpotBugs</li>
+                            <li>OWASP Dependency Check</li>
+                            <li>Gitleaks Secrets Scan</li>
+                            <li>Trivy Container Scan</li>
+                            <li>ZAP DAST Scan</li>
+                        </ul>
+                        
+                        <p>All reports are attached to this email.</p>
+                        <hr>
+                        
+                        <p style="font-size:12px;color:#777;">✔ Automated by Jenkins DevSecOps Pipeline</p>
+                    </body>
+                    </html>
+                """,
+                mimeType: 'text/html',
+                attachmentsPattern: 'all_reports/**, app.log',
+                attachLog: true
+            )
         }
     }
 }
