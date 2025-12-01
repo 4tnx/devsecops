@@ -210,7 +210,7 @@ EOF
             }
         }
 
-       stage('Run WebApp') {
+        stage('Run WebApp') {
             steps {
                 sh '''
                 nohup java -jar target/*.jar > app.log 2>&1 &
@@ -227,7 +227,8 @@ EOF
                 '''
             }
         }
-        stage("ZAP Scan") {
+
+        stage('ZAP Scan') {
             steps {
                 script {
                     sh "docker rm -f zap 2>/dev/null || true"
@@ -251,6 +252,7 @@ EOF
                         error "ZAP scan failed"
                     }
                 }
+            }
             post {
                 always {
                     script {
@@ -282,7 +284,7 @@ EOF
         }
     }
 
-     post {
+    post {
         always {
             script {
                 def buildStatus = currentBuild.currentResult
@@ -333,4 +335,4 @@ EOF
             }
         }
     }
-}}
+}
