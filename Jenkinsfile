@@ -45,19 +45,34 @@ pipeline {
             }
         }
 
-        stage('SpotBugs Analysis') {
+        stage('Spotbugs') {
             steps {
-                sh 'mvn clean compile spotbugs:check || true'
-                archiveArtifacts artifacts: 'target/spotbugsXml.xml', allowEmptyArchive: true
-                archiveArtifacts artifacts: 'target/site/spotbugs.html', allowEmptyArchive: true
+                sh "mvn -B spotbugs:spotbugs || true"
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'target/site/spotbugs.html', allowEmptyArchive: true
+                }
             }
         }
 
-        stage('Build + Test') {
+       stage('Build') {
             steps {
-                sh 'mvn clean verify -DskipTests=false'
+                sh "mvn -B -DskipTests clean package"
             }
         }
+
+        stage('Unit Tests') {
+            steps {
+                sh "mvn -B test || true"
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: '**/surefire-reports/*.xml'
+                }
+            }
+        }
+
 
         stage('Verify Workspace') {
             steps {
@@ -105,39 +120,40 @@ EOF
                 }
             }
         }
-
-        stage('Trivy Scan') {
+stage('Dependency Check') {
             steps {
-                script {
-                    sh '''
-                    echo "Running Trivy vulnerability scan..."
-                    mkdir -p trivy_reports
-                    # Clean Trivy cache if needed
-                    trivy image --clear-cache 2>/dev/null || true
-                    
-                    # Run Trivy with increased timeout and limited scanners for speed
-                    trivy image \
-                        --timeout 20m \
-                        --scanners vuln \
-                        --severity HIGH,CRITICAL \
-                        --format template \
-                        --template "@/usr/local/share/trivy/templates/html.tpl" \
-                        -o trivy_reports/trivy-report.html \
-                        ${DOCKER_IMAGE_NAME} \
-                        || echo "Trivy scan completed with exit code: $?"
-                    
-                    # Also generate a JSON report for SonarQube integration
-                    trivy image --format json -o trivy_reports/trivy-report.json ${DOCKER_IMAGE_NAME} || true
-                    '''
-                }
+                sh """
+                    dependency-check.sh \
+                        --scan . \
+                        --format HTML \
+                        --out dependency-check-report \
+                        --noupdate \
+                        || true
+                """
             }
             post {
                 always {
-                    script {
-                        if (fileExists('trivy_reports/trivy-report.html')) {
-                            archiveArtifacts artifacts: 'trivy_reports/trivy-report.html', allowEmptyArchive: true
-                        }
-                    }
+                    archiveArtifacts artifacts: 'dependency-check-report/*.html', allowEmptyArchive: true
+                }
+            }
+        }
+        stage('Trivy Scan') {
+            steps {
+                sh """
+                    echo "Running Trivy vulnerability scan..."
+                    mkdir -p trivy_reports
+                    trivy image \
+                        --timeout 15m \
+                        --format template \
+                        --template "@/usr/local/share/trivy/templates/html.tpl" \
+                        -o trivy_reports/trivy-report.html \
+                        testfoodfreezy \
+                        || true
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy_reports/*.html', allowEmptyArchive: true
                 }
             }
         }
@@ -209,73 +225,64 @@ EOF
             }
         }
 
-      stage("ZAP Scan") {
-    steps {
-        script {
-            sh "docker rm -f zap 2>/dev/null || true"
-
-            // Run ZAP in background
-            sh """
-                docker run -d --network host --name zap ghcr.io/zaproxy/zaproxy:stable sleep infinity
-            """
-
-            // Create working directory
-            sh "docker exec zap mkdir -p /zap/wrk"
-
-            // Run scan + generate report in correct folder
-            def zapExit = sh(
-                script: """
-                    docker exec zap zap-full-scan.py \
-                        -t http://localhost:8080 \
-                        -r /zap/wrk/report.html
-                """,
-                returnStatus: true
-            )
-
-            // Copy report safely
-            sh "mkdir -p ${WORKSPACE}/zap_reports"
-            sh """
-                if docker exec zap test -f /zap/wrk/report.html; then
-                    docker cp zap:/zap/wrk/report.html ${WORKSPACE}/zap_reports/report.html
-                else
-                    echo 'ZAP report not found!'
-                    echo '<h1>No ZAP report generated</h1>' > ${WORKSPACE}/zap_reports/report.html
-                fi
-            """
-
-            echo "ZAP scan finished with exit code: ${zapExit}"
-
-            // Exit codes 1,3 indicate issues found, but still generate report
-            if (zapExit == 1 || zapExit == 3) {
-                echo "ZAP reported findings—continuing."
-            }
-        }
-    }
-
-    post {
-        always {
-            archiveArtifacts artifacts: 'zap_reports/*.html', allowEmptyArchive: true
-            sh "docker rm -f zap || true"
-        }
-    }
-}
-
-
-
-        stage('Sonar Analysis') {
+      stage('ZAP Scan') {
             steps {
-                withSonarQubeEnv('SonarQubeServer') {
-                    sh "mvn sonar:sonar -Dsonar.projectKey=devops_java -Dsonar.host.url=http://192.168.50.4:9000 -Dsonar.login=${SONAR_TOKEN}"
+                script {
+                    sh "docker rm -f zap 2>/dev/null || true"
+
+                    sh """
+                        docker run -d --network host --name zap ghcr.io/zaproxy/zaproxy:stable sleep infinity
+                    """
+
+                    sh "docker exec zap mkdir -p /zap/wrk"
+
+                    def zapExit = sh(
+                        script: """
+                            docker exec zap zap-full-scan.py \
+                                -t http://localhost:8080 \
+                                -r /zap/wrk/report.html
+                        """,
+                        returnStatus: true
+                    )
+
+                    echo "ZAP exit code: ${zapExit}"
+
+                    sh "mkdir -p zap_reports"
+
+                    sh """
+                        if docker exec zap test -f /zap/wrk/report.html; then
+                            docker cp zap:/zap/wrk/report.html zap_reports/report.html
+                        else
+                            echo '<h1>No ZAP report generated</h1>' > zap_reports/report.html
+                        fi
+                    """
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'zap_reports/*.html', allowEmptyArchive: true
+                    sh "docker rm -f zap || true"
                 }
             }
         }
 
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('sonar-server') {
+                    sh """
+                        mvn -B sonar:sonar \
+                        -Dsonar.token=${SONAR_TOKEN}
+                    """
+                }
+            }
+        }
+
+
         stage('Quality Gate') {
             steps {
-                script {
-                    timeout(time: 5, unit: 'MINUTES') {
-                        waitForQualityGate abortPipeline: false
-                    }
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: false
                 }
             }
         }
