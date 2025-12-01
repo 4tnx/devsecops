@@ -111,7 +111,7 @@ pipeline {
 FROM openjdk:17-jdk-slim
 WORKDIR /app
 COPY target/*.jar app.jar
-EXPOSE 8083
+EXPOSE 8089
 ENTRYPOINT ["java", "-jar", "app.jar"]
 EOF
                         docker build -t ${DOCKER_IMAGE_NAME} .
@@ -212,7 +212,7 @@ stage('Dependency Check') {
                 sh '''
                 nohup java -jar target/*.jar > app.log 2>&1 &
                 for i in {1..30}; do
-                    if curl -s http://localhost:8083/  > /dev/null; then
+                    if curl -s http://localhost:8089/  > /dev/null; then
                         echo "Application is up!"
                         exit 0
                     fi
@@ -240,7 +240,7 @@ stage('Dependency Check') {
                     def zapExit = sh(
                         script: """
                             docker exec zap zap-full-scan.py \
-                                -t http://localhost:8083 \
+                                -t http://localhost:8089 \
                                 -r /zap/wrk/report.html
                         """,
                         returnStatus: true
