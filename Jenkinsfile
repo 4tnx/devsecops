@@ -127,38 +127,40 @@ pipeline {
         }
 
         stage("ZAP Scan") {
-            steps {
-                script {
-                    sh "docker rm -f zap 2>/dev/null || true"
+    steps {
+        script {
+            sh "docker rm -f zap 2>/dev/null || true"
 
-                    sh """
-                        docker run -d --network host --name zap ghcr.io/zaproxy/zaproxy:stable sleep infinity
-                    """
-                    sh "docker exec zap mkdir -p /zap/"
+            // Run ZAP with volume mapping
+            sh """
+                docker run -d --network host --name zap \
+                    -v ${WORKSPACE}/zap_reports:/zap/wrk \
+                    ghcr.io/zaproxy/zaproxy:stable sleep infinity
+            """
 
-                    def zapExit = sh(
-                        script: "docker exec zap zap-full-scan.py -t http://localhost:8080 -r /zap/report.html",
-                        returnStatus: true
-                    )
+            def zapExit = sh(
+                script: """
+                    docker exec zap zap-full-scan.py -t http://localhost:8080 -r /zap/wrk/report.html
+                """,
+                returnStatus: true
+            )
 
-                    sh "mkdir -p ${WORKSPACE}/zap_reports"
-                    sh "docker cp zap:/zap/report.html ${WORKSPACE}/zap_reports/report.html"
+            echo "ZAP scan finished with exit code: ${zapExit}"
 
-                    echo "ZAP scan finished with exit code: ${zapExit}"
-
-                    if (zapExit == 1 || zapExit == 3) {
-                        error "ZAP scan failed"
-                    }
-                }
-            }
-
-            post {
-                always {
-                    archiveArtifacts artifacts: 'zap_reports/*.html', allowEmptyArchive: true
-                    sh "docker rm -f zap || true"
-                }
+            if (zapExit != 0) {
+                error "ZAP scan failed"
             }
         }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'zap_reports/*.html', allowEmptyArchive: true
+            sh "docker rm -f zap || true"
+        }
+    }
+}
+
 
         stage('Sonar Analysis') {
             steps {
