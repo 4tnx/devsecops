@@ -113,7 +113,7 @@ pipeline {
                 sh '''
                 nohup java -jar target/*.jar > app.log 2>&1 &
                 for i in {1..30}; do
-                    if curl -s http://localhost:8089/  > /dev/null; then
+                    if curl -s http://localhost:8080/  > /dev/null; then
                         echo "Application is up!"
                         exit 0
                     fi
@@ -137,7 +137,7 @@ pipeline {
                     sh "docker exec zap mkdir -p /zap/"
 
                     def zapExit = sh(
-                        script: "docker exec zap zap-full-scan.py -t http://localhost:8089 -r /zap/report.html",
+                        script: "docker exec zap zap-full-scan.py -t http://localhost:8080 -r /zap/report.html",
                         returnStatus: true
                     )
 
