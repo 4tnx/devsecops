@@ -8,6 +8,7 @@ pipeline {
 
     environment {
         SONAR_TOKEN = credentials('sonar-token')
+        NVD_API_KEY = credentials('8ee6ac6e-8bc0-4163-889a-1245e99546c5')
     }
 
     stages {
@@ -34,13 +35,19 @@ pipeline {
 
         }
 
-        stage('SpotBugs Analysis') {
-            steps {
-                sh 'mvn clean compile spotbugs:check || true'
-                archiveArtifacts artifacts: 'target/spotbugsXml.xml', allowEmptyArchive: true
-                archiveArtifacts artifacts: 'target/site/spotbugs.html', allowEmptyArchive: true
-            }
-        }
+stage('SpotBugs Analysis') {
+    steps {
+        sh 'mvn clean compile spotbugs:spotbugs || true'
+        sh '''
+        echo "Looking for SpotBugs reports..."
+        find . -name "spotbugsXml.xml" -type f | head -5
+        find . -name "spotbugs.html" -type f | head -5
+        '''
+        // Try multiple possible locations
+        archiveArtifacts artifacts: '**/target/spotbugsXml.xml,**/target/spotbugsXml/**/*.xml,target/**/spotbugs*.xml', allowEmptyArchive: true
+        archiveArtifacts artifacts: '**/target/site/spotbugs.html,**/spotbugs.html', allowEmptyArchive: true
+    }
+}
 
         stage('Build + Test') {
             steps {
@@ -109,22 +116,33 @@ pipeline {
         }
 
         stage('Run WebApp') {
-            steps {
-                sh '''
-                nohup java -jar target/*.jar > app.log 2>&1 &
-                for i in {1..30}; do
-                    if curl -s http://localhost:8089/  > /dev/null; then
-                        echo "Application is up!"
-                        exit 0
-                    fi
-                    echo "Waiting app to be ready..."
-                    sleep 2
-                done
-                echo "Application failed to start!"
-                exit 1
-                '''
-            }
-        }
+    steps {
+        sh '''
+        # Kill any existing process on port 8089
+        fuser -k 8089/tcp 2>/dev/null || true
+        
+        # Start the application
+        nohup java -jar target/FoodFrenzy-0.0.1-SNAPSHOT.jar --server.port=8089 > app.log 2>&1 &
+        
+        # Wait for application to start
+        echo "Waiting for application to start..."
+        for i in {1..30}; do
+            if curl -s http://localhost:8089/actuator/health > /dev/null 2>&1; then
+                echo "✓ Application is up and running!"
+                curl -s http://localhost:8089/actuator/health | jq . 2>/dev/null || true
+                exit 0
+            fi
+            echo "Attempt $i/30: Waiting for application..."
+            sleep 3
+        done
+        
+        echo "✗ Application failed to start within 90 seconds"
+        echo "=== Last 50 lines of app.log ==="
+        tail -50 app.log
+        exit 1
+        '''
+    }
+}
 
         stage("ZAP Scan") {
             steps {

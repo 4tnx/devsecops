@@ -108,7 +108,10 @@
     <artifactId>dependency-check-maven</artifactId>
     <version>12.1.0</version>
     <configuration>
+        <failBuildOnCVSS>8</failBuildOnCVSS>
         <nvdApiKey>${env.NVD_API_KEY}</nvdApiKey>
+        <cveValidForHours>24</cveValidForHours>
+        <dataDirectory>${project.build.directory}/dependency-check-data</dataDirectory>
     </configuration>
 </plugin>
         </plugins>
