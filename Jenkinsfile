@@ -134,7 +134,7 @@ pipeline {
                     sh """
                         docker run -d --network host --name zap ghcr.io/zaproxy/zaproxy:stable sleep infinity
                     """
-                    sh "docker exec zap mkdir -p /zap/wrk"
+                    sh "docker exec zap mkdir -p /zap/"
 
                     def zapExit = sh(
                         script: "docker exec zap zap-full-scan.py -t http://localhost:8089 -r /zap/report.html",
